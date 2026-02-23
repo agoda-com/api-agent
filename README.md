@@ -100,9 +100,38 @@ That's it. Agent introspects schema, generates queries, runs SQL post-processing
 | `X-Target-Headers`     | No       | JSON auth headers, e.g. `{"Authorization": "Bearer xxx"}`  |
 | `X-API-Name`           | No       | Override tool name prefix (default: auto-generated)        |
 | `X-Base-URL`           | No       | Override base URL for REST API calls                       |
-| `X-Allow-Unsafe-Paths` | No       | JSON array of glob patterns for POST/PUT/DELETE/PATCH      |
-| `X-Poll-Paths`         | No       | JSON array of paths requiring polling (enables poll tool)  |
+| `X-Allow-Unsafe-Paths` | No       | Header string containing JSON array of `fnmatch` globs (`*`, `?`) for POST/PUT/DELETE/PATCH |
+| `X-Poll-Paths`         | No       | Header string containing JSON array of polling path patterns (enables poll tool) |
 | `X-Include-Result`     | No       | Include full uncapped `result` field in output             |
+
+#### Header value examples
+
+`X-Allow-Unsafe-Paths` and `X-Poll-Paths` use the same escaping format: JSON array encoded as a header string.
+
+**MCP config (JSON):**
+```json
+{
+  "headers": {
+    "X-Allow-Unsafe-Paths": "[\"/search\", \"/api/*/query\", \"/jobs/*/cancel\"]",
+    "X-Poll-Paths": "[\"/search\", \"/trips/*/status\"]"
+  }
+}
+```
+
+**`X-Allow-Unsafe-Paths` pattern examples:**
+- `"/search"` exact path
+- `"/api/*/query"` one wildcard segment
+- `"/jobs/*"` any suffix under `/jobs/`
+
+**`X-Poll-Paths` pattern examples:**
+- `"/search"` exact polling path
+- `"/trips/*/status"` wildcard polling path
+
+`X-Poll-Paths` enables polling guidance/tooling; `X-Allow-Unsafe-Paths` controls unsafe method allowlist.
+
+**Escaping quick check (same for both headers):**
+- wrong: `"X-Allow-Unsafe-Paths": "["/search"]"`
+- right: `"X-Allow-Unsafe-Paths": "[\"/search\"]"`
 
 ### MCP Tools
 
