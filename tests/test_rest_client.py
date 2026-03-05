@@ -1,5 +1,8 @@
 """Tests for REST client."""
 
+from unittest.mock import patch
+
+import httpx
 import pytest
 
 from api_agent.rest.client import _build_url, _is_path_allowed, execute_request
@@ -181,3 +184,34 @@ class TestExecuteRequest:
         )
         # Will fail with connection error but NOT blocked
         assert "not allowed" not in result.get("error", "")
+
+    @pytest.mark.asyncio
+    async def test_http_status_error_includes_status_code_and_details(self):
+        request = httpx.Request("GET", "https://api.example.com/users")
+        response = httpx.Response(404, request=request, json={"error": "missing"})
+
+        class _Resp:
+            def raise_for_status(self):
+                raise httpx.HTTPStatusError("Not found", request=request, response=response)
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, *_args, **_kwargs):
+                return _Resp()
+
+        with patch("api_agent.rest.client.httpx.AsyncClient", return_value=_Client()):
+            result = await execute_request(
+                "GET",
+                "/users",
+                base_url="https://api.example.com",
+            )
+
+        assert result["success"] is False
+        assert result["error"] == "HTTP 404"
+        assert result["status_code"] == 404
+        assert result["details"] == "missing"

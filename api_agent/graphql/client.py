@@ -6,6 +6,8 @@ from typing import Any
 
 import httpx
 
+from ..utils.http_errors import build_http_error_response
+
 logger = logging.getLogger(__name__)
 
 # Block mutations (read-only mode)
@@ -57,7 +59,7 @@ async def execute_query(
                 return {"success": False, "error": result["errors"]}
             return {"success": True, "data": result.get("data", {})}
         except httpx.HTTPStatusError as e:
-            return {"success": False, "error": f"HTTP {e.response.status_code}"}
+            return build_http_error_response(e)
         except Exception as e:
             logger.exception("GraphQL error")
             return {"success": False, "error": str(e)}

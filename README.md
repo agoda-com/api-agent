@@ -56,7 +56,7 @@ That's it. Agent introspects schema, generates queries, runs SQL post-processing
 
 ## More Examples
 
-**REST API (Petstore):**
+**REST API (Petstore — OpenAPI 3.x):**
 ```json
 {
   "mcpServers": {
@@ -64,6 +64,21 @@ That's it. Agent introspects schema, generates queries, runs SQL post-processing
       "url": "http://localhost:3000/mcp",
       "headers": {
         "X-Target-URL": "https://petstore3.swagger.io/api/v3/openapi.json",
+        "X-API-Type": "rest"
+      }
+    }
+  }
+}
+```
+
+**REST API (Petstore — Swagger 2.0):**
+```json
+{
+  "mcpServers": {
+    "petstore": {
+      "url": "http://localhost:3000/mcp",
+      "headers": {
+        "X-Target-URL": "https://petstore.swagger.io/v2/swagger.json",
         "X-API-Type": "rest"
       }
     }
@@ -95,7 +110,7 @@ That's it. Agent introspects schema, generates queries, runs SQL post-processing
 
 | Header                 | Required | Description                                                |
 | ---------------------- | -------- | ---------------------------------------------------------- |
-| `X-Target-URL`         | Yes      | GraphQL endpoint OR OpenAPI spec URL                       |
+| `X-Target-URL`         | Yes      | GraphQL endpoint OR OpenAPI/Swagger spec URL (3.x and 2.0) |
 | `X-API-Type`           | Yes      | `graphql` or `rest`                                        |
 | `X-Target-Headers`     | No       | JSON auth headers, e.g. `{"Authorization": "Bearer xxx"}`  |
 | `X-API-Name`           | No       | Override tool name prefix (default: auto-generated)        |

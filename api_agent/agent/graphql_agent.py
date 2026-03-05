@@ -391,6 +391,11 @@ def _create_graphql_query_tool(ctx: RequestContext):
                     indent=2,
                 )
 
+        if not result.get("success"):
+            result["hint"] = (
+                "Use search_schema to find valid field names, enum values, or required args"
+            )
+
         return json.dumps(result, indent=2)
 
     return graphql_query
@@ -463,7 +468,10 @@ def _create_individual_recipe_tools(
         tool_name = deduplicate_tool_name(s.get("tool_name", "unknown_recipe"), seen_names)
         params_spec = recipe.get("params", {})
         docstring = build_recipe_docstring(
-            s["question"], recipe.get("steps", []), recipe.get("sql_steps", []), "graphql",
+            s["question"],
+            recipe.get("steps", []),
+            recipe.get("sql_steps", []),
+            "graphql",
             params_spec=params_spec,
         )
 

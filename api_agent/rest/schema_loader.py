@@ -12,6 +12,220 @@ from ..config import settings
 logger = logging.getLogger(__name__)
 
 
+def _rewrite_swagger_ref(ref: Any) -> Any:
+    """Rewrite Swagger 2 refs to OpenAPI 3 refs."""
+    if not isinstance(ref, str):
+        return ref
+    return ref.replace("#/definitions/", "#/components/schemas/")
+
+
+def _rewrite_refs(value: Any) -> Any:
+    """Recursively rewrite refs from Swagger 2 to OpenAPI 3 paths."""
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            if k == "$ref":
+                out[k] = _rewrite_swagger_ref(v)
+            else:
+                out[k] = _rewrite_refs(v)
+        return out
+    if isinstance(value, list):
+        return [_rewrite_refs(v) for v in value]
+    return value
+
+
+def _swagger_param_to_oas3(param: Any) -> dict[str, Any] | None:
+    """Convert non-body Swagger 2 parameter to OpenAPI 3 parameter."""
+    if not isinstance(param, dict):
+        return None
+    if param.get("in") == "body":
+        return None
+
+    converted = _rewrite_refs(param)
+    if "schema" in converted and isinstance(converted["schema"], dict):
+        return converted
+
+    # Swagger 2 allows schema fields directly on parameter.
+    schema: dict[str, Any] = {}
+    for key in ["type", "format", "items", "enum", "default", "minimum", "maximum"]:
+        if key in converted:
+            schema[key] = converted[key]  # already rewritten
+    if schema:
+        converted["schema"] = schema
+    return converted
+
+
+def _swagger_request_body_to_oas3(parameters: list[Any]) -> tuple[dict[str, Any] | None, list[Any]]:
+    """Extract Swagger 2 body parameter and return OAS3 requestBody + remaining params."""
+    request_body: dict[str, Any] | None = None
+    remaining: list[Any] = []
+    for p in parameters:
+        if isinstance(p, dict) and p.get("in") == "body" and request_body is None:
+            schema = p.get("schema", {})
+            if isinstance(schema, dict):
+                request_body = {
+                    "required": bool(p.get("required", False)),
+                    "content": {"application/json": {"schema": _rewrite_refs(schema)}},
+                }
+            continue
+        remaining.append(p)
+    return request_body, remaining
+
+
+def _swagger_responses_to_oas3(responses: Any) -> dict[str, Any]:
+    """Convert Swagger 2 responses shape to OpenAPI 3 responses shape."""
+    if not isinstance(responses, dict):
+        return {}
+
+    out: dict[str, Any] = {}
+    for code, resp in responses.items():
+        if not isinstance(resp, dict):
+            continue
+        converted = _rewrite_refs(resp)
+        schema = converted.pop("schema", None)
+        if isinstance(schema, dict):
+            converted["content"] = {"application/json": {"schema": schema}}
+        out[str(code)] = converted
+    return out
+
+
+def _swagger_security_to_oas3(security_definitions: Any) -> dict[str, Any]:
+    """Convert Swagger 2 securityDefinitions to OAS3 securitySchemes."""
+    if not isinstance(security_definitions, dict):
+        return {}
+
+    out: dict[str, Any] = {}
+    for name, scheme in security_definitions.items():
+        if not isinstance(scheme, dict):
+            continue
+        scheme_type = scheme.get("type", "")
+        converted = _rewrite_refs(scheme)
+        if scheme_type == "basic":
+            converted = {"type": "http", "scheme": "basic"}
+        elif scheme_type == "oauth2":
+            flow = scheme.get("flow", "")
+            flows: dict[str, Any] = {}
+            scopes = scheme.get("scopes", {})
+            if flow == "accessCode":
+                flows["authorizationCode"] = {
+                    "authorizationUrl": scheme.get("authorizationUrl", ""),
+                    "tokenUrl": scheme.get("tokenUrl", ""),
+                    "scopes": scopes if isinstance(scopes, dict) else {},
+                }
+            elif flow == "application":
+                flows["clientCredentials"] = {
+                    "tokenUrl": scheme.get("tokenUrl", ""),
+                    "scopes": scopes if isinstance(scopes, dict) else {},
+                }
+            elif flow == "password":
+                flows["password"] = {
+                    "tokenUrl": scheme.get("tokenUrl", ""),
+                    "scopes": scopes if isinstance(scopes, dict) else {},
+                }
+            else:
+                flows["implicit"] = {
+                    "authorizationUrl": scheme.get("authorizationUrl", ""),
+                    "scopes": scopes if isinstance(scopes, dict) else {},
+                }
+            converted = {"type": "oauth2", "flows": flows}
+        out[name] = converted
+    return out
+
+
+def _swagger_servers_from_spec(swagger_spec: dict[str, Any]) -> list[dict[str, str]]:
+    """Build OAS3 servers from Swagger 2 host/basePath/schemes fields."""
+    host = swagger_spec.get("host", "")
+    base_path = swagger_spec.get("basePath", "")
+    if not isinstance(host, str) or not host:
+        return []
+    if not isinstance(base_path, str):
+        base_path = ""
+    if base_path and not base_path.startswith("/"):
+        base_path = f"/{base_path}"
+
+    schemes = swagger_spec.get("schemes", [])
+    if not isinstance(schemes, list):
+        schemes = []
+    scheme_list = [s for s in schemes if isinstance(s, str) and s]
+    if not scheme_list:
+        scheme_list = ["https"]
+    return [{"url": f"{s}://{host}{base_path}"} for s in scheme_list]
+
+
+def normalize_swagger2_to_oas3(swagger_spec: dict[str, Any]) -> dict[str, Any]:
+    """Normalize Swagger 2.0 spec into minimal OpenAPI 3.x structure."""
+    out: dict[str, Any] = {
+        "openapi": "3.0.3",
+        "info": _rewrite_refs(swagger_spec.get("info", {}))
+        if isinstance(swagger_spec.get("info"), dict)
+        else {},
+        "paths": {},
+        "components": {
+            "schemas": _rewrite_refs(swagger_spec.get("definitions", {}))
+            if isinstance(swagger_spec.get("definitions"), dict)
+            else {},
+            "securitySchemes": _swagger_security_to_oas3(
+                swagger_spec.get("securityDefinitions", {})
+            ),
+        },
+    }
+
+    servers = _swagger_servers_from_spec(swagger_spec)
+    if servers:
+        out["servers"] = servers
+
+    paths = swagger_spec.get("paths", {})
+    if not isinstance(paths, dict):
+        paths = {}
+
+    for path, path_item in paths.items():
+        if not isinstance(path, str) or not isinstance(path_item, dict):
+            continue
+        out_path_item: dict[str, Any] = {}
+
+        path_level_params_raw = path_item.get("parameters", [])
+        if not isinstance(path_level_params_raw, list):
+            path_level_params_raw = []
+        path_level_params = []
+        for p in path_level_params_raw:
+            converted_param = _swagger_param_to_oas3(p)
+            if converted_param:
+                path_level_params.append(converted_param)
+        if path_level_params:
+            out_path_item["parameters"] = path_level_params
+
+        for method in ["get", "post", "put", "delete", "patch", "options", "head"]:
+            op = path_item.get(method)
+            if not isinstance(op, dict):
+                continue
+
+            new_op = _rewrite_refs(op)
+            raw_params = op.get("parameters", [])
+            if not isinstance(raw_params, list):
+                raw_params = []
+            request_body, non_body_params = _swagger_request_body_to_oas3(raw_params)
+
+            converted_params = []
+            for p in non_body_params:
+                converted_param = _swagger_param_to_oas3(p)
+                if converted_param:
+                    converted_params.append(converted_param)
+            if converted_params:
+                new_op["parameters"] = converted_params
+            else:
+                new_op.pop("parameters", None)
+
+            if request_body:
+                new_op["requestBody"] = request_body
+
+            new_op["responses"] = _swagger_responses_to_oas3(op.get("responses", {}))
+            out_path_item[method] = new_op
+
+        out["paths"][path] = out_path_item
+
+    return out
+
+
 async def load_openapi_spec(
     spec_url: str,
     headers: dict[str, str] | None = None,
@@ -46,13 +260,20 @@ async def load_openapi_spec(
             logger.warning("OpenAPI spec root is not an object")
             return {}
 
-        # Validate OpenAPI 3.x
+        # Validate/normalize API schema shape
         openapi_version = spec.get("openapi", "")
-        if not isinstance(openapi_version, str) or not openapi_version.startswith("3."):
-            logger.warning(f"Unsupported OpenAPI version: {openapi_version}, expected 3.x")
-            return {}
+        if isinstance(openapi_version, str) and openapi_version.startswith("3."):
+            return spec
 
-        return spec
+        swagger_version = spec.get("swagger", "")
+        if isinstance(swagger_version, str) and swagger_version.startswith("2."):
+            logger.info("Detected Swagger 2.0 spec, normalizing to OpenAPI 3.0 shape")
+            return normalize_swagger2_to_oas3(spec)
+
+        logger.warning(
+            f"Unsupported API schema version. openapi={openapi_version!r}, swagger={swagger_version!r}"
+        )
+        return {}
 
     except Exception as e:
         logger.exception(f"Failed to load OpenAPI spec: {e}")

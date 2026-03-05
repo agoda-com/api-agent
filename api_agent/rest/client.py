@@ -7,6 +7,8 @@ from urllib.parse import urlencode, urljoin
 
 import httpx
 
+from ..utils.http_errors import build_http_error_response
+
 logger = logging.getLogger(__name__)
 
 # Unsafe HTTP methods (blocked by default)
@@ -138,15 +140,7 @@ async def execute_request(
             return {"success": True, "data": data}
 
         except httpx.HTTPStatusError as e:
-            # Try to get error body
-            try:
-                error_body = e.response.json()
-            except Exception:
-                error_body = e.response.text[:500]
-            return {
-                "success": False,
-                "error": f"HTTP {e.response.status_code}: {error_body}",
-            }
+            return build_http_error_response(e)
         except Exception as e:
             logger.exception("REST API error")
             return {"success": False, "error": str(e)}

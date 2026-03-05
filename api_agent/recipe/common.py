@@ -202,7 +202,9 @@ def build_recipe_docstring(
     if params_spec:
         param_lines = []
         for pname, spec in params_spec.items():
-            ptype = _JSON_TYPE_NAMES.get(spec.get("type", "str") if isinstance(spec, dict) else "str", "string")
+            ptype = _JSON_TYPE_NAMES.get(
+                spec.get("type", "str") if isinstance(spec, dict) else "str", "string"
+            )
             example = spec.get("default") if isinstance(spec, dict) else None
             hint = f" (e.g. {example})" if example is not None else ""
             param_lines.append(f"  {pname}: {ptype} REQUIRED{hint}")

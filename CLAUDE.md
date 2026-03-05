@@ -85,9 +85,10 @@ docker run -p 3000:3000 -e OPENAI_API_KEY="..." api-agent
 
 - **api_agent/utils/**: Shared utilities
   - **csv.py**: CSV conversion via DuckDB (for recipe `return_directly` output)
+  - **http_errors.py**: HTTP error response extraction (used by both clients)
 
 - **api_agent/graphql/**: GraphQL client (httpx)
-- **api_agent/rest/**: REST client (httpx) + OpenAPI loader
+- **api_agent/rest/**: REST client (httpx) + OpenAPI loader (supports OpenAPI 3.x and Swagger 2.0)
 - **api_agent/executor.py**: DuckDB SQL execution, table extraction, context truncation
 
 ### Context Management
@@ -130,6 +131,16 @@ Query → Agent executes → Extractor LLM → Recipe stored → MCP tool `r_{na
 - **Deduplication**: Skips equivalent recipes, ensures unique tool names
 - **Templating**: GraphQL `{{param}}`, REST `{"$param": "name"}`, SQL `{{param}}`
 - **Config**: `ENABLE_RECIPES` (default: True), `RECIPE_CACHE_SIZE` (default: 64)
+
+## After Code Changes
+
+Always run before marking task complete:
+```bash
+uv run ruff check --fix api_agent/  # Lint + auto-fix
+uv run ruff format api_agent/        # Format
+uv run ty check                      # Type check
+uv run pytest tests/ -v              # Tests
+```
 
 ## Testing Notes
 

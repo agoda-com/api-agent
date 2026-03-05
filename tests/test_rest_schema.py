@@ -1,13 +1,25 @@
 """Tests for REST/OpenAPI schema context generation."""
 
+import json
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import httpx
 import pytest
 
 from api_agent.rest.schema_loader import (
+    _rewrite_swagger_ref,
+    _swagger_param_to_oas3,
+    _swagger_request_body_to_oas3,
+    _swagger_responses_to_oas3,
+    _swagger_security_to_oas3,
+    _swagger_servers_from_spec,
     _format_params,
     _format_schema,
     _infer_string_format,
     _schema_to_type,
     build_schema_context,
+    load_openapi_spec,
+    normalize_swagger2_to_oas3,
 )
 
 
@@ -372,3 +384,164 @@ class TestBuildSchemaContext:
         ctx = build_schema_context(spec)
         assert "PUT /update(body: Data)" in ctx
         assert "body: Data!" not in ctx  # not required
+
+
+class TestSwagger2Normalization:
+    def test_normalize_swagger2_basic_shapes(self):
+        swagger_spec = {
+            "swagger": "2.0",
+            "info": {"title": "OKR API", "version": "2.0"},
+            "host": "api.example.com",
+            "basePath": "/v1",
+            "schemes": ["https"],
+            "paths": {
+                "/users/{id}": {
+                    "parameters": [{"name": "id", "in": "path", "required": True, "type": "string"}],
+                    "get": {
+                        "summary": "Get user",
+                        "responses": {"200": {"schema": {"$ref": "#/definitions/User"}}},
+                    },
+                    "post": {
+                        "summary": "Update user",
+                        "parameters": [
+                            {
+                                "name": "body",
+                                "in": "body",
+                                "required": True,
+                                "schema": {"$ref": "#/definitions/UpdateUser"},
+                            }
+                        ],
+                        "responses": {"200": {"schema": {"$ref": "#/definitions/User"}}},
+                    },
+                }
+            },
+            "definitions": {
+                "User": {
+                    "type": "object",
+                    "properties": {"id": {"type": "string"}},
+                    "required": ["id"],
+                },
+                "UpdateUser": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"],
+                },
+            },
+            "securityDefinitions": {"basicAuth": {"type": "basic"}},
+        }
+
+        normalized = normalize_swagger2_to_oas3(swagger_spec)
+
+        assert normalized["openapi"].startswith("3.")
+        assert normalized["servers"] == [{"url": "https://api.example.com/v1"}]
+        assert "components" in normalized
+        assert "schemas" in normalized["components"]
+        assert "User" in normalized["components"]["schemas"]
+        assert normalized["components"]["securitySchemes"]["basicAuth"] == {
+            "type": "http",
+            "scheme": "basic",
+        }
+
+        get_op = normalized["paths"]["/users/{id}"]["get"]
+        assert get_op["responses"]["200"]["content"]["application/json"]["schema"]["$ref"] == (
+            "#/components/schemas/User"
+        )
+
+        post_op = normalized["paths"]["/users/{id}"]["post"]
+        assert post_op["requestBody"]["required"] is True
+        assert (
+            post_op["requestBody"]["content"]["application/json"]["schema"]["$ref"]
+            == "#/components/schemas/UpdateUser"
+        )
+
+    def test_build_context_from_normalized_swagger2(self):
+        swagger_spec = {
+            "swagger": "2.0",
+            "paths": {
+                "/users/{id}": {
+                    "get": {
+                        "parameters": [{"name": "id", "in": "path", "required": True, "type": "string"}],
+                        "responses": {"200": {"schema": {"$ref": "#/definitions/User"}}},
+                    }
+                }
+            },
+            "definitions": {
+                "User": {
+                    "type": "object",
+                    "properties": {"id": {"type": "string"}},
+                    "required": ["id"],
+                }
+            },
+        }
+        normalized = normalize_swagger2_to_oas3(swagger_spec)
+        ctx = build_schema_context(normalized)
+        assert "GET /users/{id}(id: str) -> User" in ctx
+        assert "User { id: str! }" in ctx
+
+
+class TestSwagger2Helpers:
+    def test_rewrite_swagger_ref(self):
+        assert _rewrite_swagger_ref("#/definitions/User") == "#/components/schemas/User"
+
+    def test_swagger_param_conversion(self):
+        result = _swagger_param_to_oas3({"name": "limit", "in": "query", "type": "integer"})
+        assert result is not None
+        assert result["schema"]["type"] == "integer"
+
+    def test_swagger_request_body_extraction(self):
+        body, remaining = _swagger_request_body_to_oas3(
+            [
+                {"in": "body", "name": "data", "required": True, "schema": {"type": "object"}},
+                {"in": "query", "name": "limit", "type": "integer"},
+            ]
+        )
+        assert body is not None
+        assert body["required"] is True
+        assert len(remaining) == 1
+
+    def test_swagger_response_conversion(self):
+        responses = {"200": {"description": "ok", "schema": {"$ref": "#/definitions/User"}}}
+        result = _swagger_responses_to_oas3(responses)
+        assert result["200"]["content"]["application/json"]["schema"]["$ref"] == (
+            "#/components/schemas/User"
+        )
+
+    def test_swagger_security_conversion(self):
+        result = _swagger_security_to_oas3({"basicAuth": {"type": "basic"}})
+        assert result["basicAuth"] == {"type": "http", "scheme": "basic"}
+
+    def test_swagger_servers_from_spec(self):
+        result = _swagger_servers_from_spec(
+            {"host": "api.example.com", "basePath": "/v1", "schemes": ["https"]}
+        )
+        assert result == [{"url": "https://api.example.com/v1"}]
+
+
+def _mock_http_response(status: int, text: str):
+    mock_resp = MagicMock(spec=httpx.Response)
+    mock_resp.status_code = status
+    mock_resp.text = text
+    if status >= 400:
+        mock_resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "error", request=MagicMock(), response=mock_resp
+        )
+    else:
+        mock_resp.raise_for_status.return_value = None
+    return mock_resp
+
+
+def _patch_http(text: str, status: int = 200):
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=_mock_http_response(status, text))
+    return patch("httpx.AsyncClient", return_value=mock_client)
+
+
+class TestLoadOpenApiSpec:
+    @pytest.mark.asyncio
+    async def test_swagger_2_spec_normalized(self):
+        spec = json.dumps({"swagger": "2.0", "info": {}, "paths": {}, "host": "api.example.com"})
+        with _patch_http(spec):
+            result = await load_openapi_spec("https://api.example.com/openapi.json")
+        assert result.get("openapi", "").startswith("3.")

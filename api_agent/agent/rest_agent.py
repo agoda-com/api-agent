@@ -538,7 +538,9 @@ def _create_individual_recipe_tools(
         tool_name = deduplicate_tool_name(s.get("tool_name", "unknown_recipe"), seen_names)
         params_spec = recipe.get("params", {})
         docstring = build_recipe_docstring(
-            s["question"], recipe.get("steps", []), recipe.get("sql_steps", []),
+            s["question"],
+            recipe.get("steps", []),
+            recipe.get("sql_steps", []),
             params_spec=params_spec,
         )
 
