@@ -237,6 +237,59 @@ class TestPollPaths:
         assert ctx.poll_paths == ()
 
 
+class TestAuthHeaders:
+    """Test X-Auth-* header extraction."""
+
+    @patch("api_agent.context.get_http_headers")
+    def test_auth_headers_parsed(self, mock_headers):
+        mock_headers.return_value = {
+            "x-target-url": "https://api.example.com",
+            "x-api-type": "rest",
+            "x-auth-url": "https://auth0.example.com/token",
+            "x-auth-body": '{"grant_type": "client_credentials", "client_id": "abc"}',
+            "x-auth-token-path": "data.token",
+        }
+        ctx = get_request_context()
+        assert ctx.auth_url == "https://auth0.example.com/token"
+        assert ctx.auth_body == {"grant_type": "client_credentials", "client_id": "abc"}
+        assert ctx.auth_token_path == "data.token"
+
+    @patch("api_agent.context.get_http_headers")
+    def test_auth_headers_default_when_absent(self, mock_headers):
+        mock_headers.return_value = {
+            "x-target-url": "https://api.example.com",
+            "x-api-type": "rest",
+        }
+        ctx = get_request_context()
+        assert ctx.auth_url is None
+        assert ctx.auth_body is None
+        assert ctx.auth_token_path == "access_token"
+
+    @patch("api_agent.context.get_http_headers")
+    def test_auth_body_invalid_json_defaults_none(self, mock_headers):
+        mock_headers.return_value = {
+            "x-target-url": "https://api.example.com",
+            "x-api-type": "rest",
+            "x-auth-url": "https://auth0.example.com/token",
+            "x-auth-body": "not-json",
+        }
+        ctx = get_request_context()
+        assert ctx.auth_url == "https://auth0.example.com/token"
+        assert ctx.auth_body is None
+
+    @patch("api_agent.context.get_http_headers")
+    def test_auth_body_ignored_without_auth_url(self, mock_headers):
+        """auth_body not parsed if auth_url is missing."""
+        mock_headers.return_value = {
+            "x-target-url": "https://api.example.com",
+            "x-api-type": "rest",
+            "x-auth-body": '{"grant_type": "client_credentials"}',
+        }
+        ctx = get_request_context()
+        assert ctx.auth_url is None
+        assert ctx.auth_body is None
+
+
 class TestGetToolNamePrefix:
     """Test tool name prefix generation (semantic, no hash)."""
 

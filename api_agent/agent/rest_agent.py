@@ -4,11 +4,13 @@ import asyncio
 import json
 import logging
 from contextvars import ContextVar
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
 from agents import Agent, MaxTurnsExceeded, Runner, function_tool
 
+from ..auth import resolve_headers
 from ..config import settings
 from ..context import RequestContext
 from ..executor import (
@@ -678,6 +680,10 @@ async def process_rest_query(question: str, ctx: RequestContext) -> dict[str, An
         _last_result.set([None])  # Mutable list: [result_value]
         _return_directly_flag.set([])  # Reset direct return flag
         reset_progress()  # Reset turn counter
+
+        # Auth middleware: resolve token and inject into headers
+        resolved = await resolve_headers(ctx)
+        ctx = replace(ctx, target_headers=resolved)
 
         # Fetch schema context (target_url = OpenAPI spec URL)
         schema_ctx, spec_base_url, raw_spec_json = await fetch_schema_context(

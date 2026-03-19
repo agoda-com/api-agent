@@ -46,19 +46,21 @@ docker run -p 3000:3000 -e OPENAI_API_KEY="..." api-agent
 1. **Client** sends MCP request w/ headers (`X-Target-URL`, `X-API-Type`, `X-Target-Headers`)
 2. **middleware.py**: `DynamicToolNamingMiddleware` transforms tool names per session (e.g., `_query` → `flights_api_query` based on URL)
 3. **context.py**: Extracts `RequestContext` from headers
-4. **tools/query.py**: Routes to GraphQL or REST agent
-5. **agent/graphql_agent.py** or **agent/rest_agent.py**:
+4. **auth.py**: If `X-Auth-URL` is set, fetches bearer token from Auth0 and injects into headers (cached with TTL)
+5. **tools/query.py**: Routes to GraphQL or REST agent
+6. **agent/graphql_agent.py** or **agent/rest_agent.py**:
    - Fetches schema (introspection or OpenAPI)
    - Creates agent w/ dynamic tools (`graphql_query`/`rest_call`, `sql_query`, `search_schema`)
    - Runs agent loop (max 30 turns)
    - Returns results
-6. **executor.py**: DuckDB integration for SQL post-processing
+7. **executor.py**: DuckDB integration for SQL post-processing
 
 ### Key Modules
 
 - **api_agent/**: Main package
   - **__main__.py**: Entry point, creates FastMCP app w/ middleware
   - **config.py**: Settings via `pydantic-settings` (env vars w/ `API_AGENT_` prefix)
+  - **auth.py**: Auth0 token middleware — fetches and caches bearer tokens (`X-Auth-URL`)
   - **context.py**: Header parsing → `RequestContext`, tool name generation
   - **middleware.py**: Dynamic tool naming per session
   - **tracing.py**: OpenTelemetry tracing via OTLP (uses [arize-otel](https://github.com/Arize-ai/openinference) for convenience, works with [Arize Phoenix](https://docs.arize.com/phoenix), Jaeger, Zipkin, Grafana Tempo, etc.)
@@ -106,6 +108,14 @@ Tools have internal names (`_query`, `_execute`) transformed by middleware per s
 - **Format**: `{prefix}_query`, `{prefix}_execute` — prefix from hostname or `X-API-Name` header
 - Skips generic parts: TLDs, `api`, `qa`, `dev`, `internal`
 - **Recipe tools**: `r_{slug}` (not API-specific), max 60 chars; `send_tool_list_changed()` notifies clients
+
+### Auth Token Generation
+
+Set `X-Auth-URL` header to enable automatic bearer token injection for all API calls (REST and GraphQL):
+- `X-Auth-URL`: Auth0 token endpoint (POST). When set, server fetches token and adds `Authorization: Bearer <token>` to all requests.
+- `X-Auth-Body`: JSON credentials payload (e.g., `{"grant_type": "client_credentials", "client_id": "...", "client_secret": "..."}`)
+- `X-Auth-Token-Path`: Dot-path to extract token from response (default: `"access_token"`)
+- Tokens cached for 5 minutes (module-level cache with TTL)
 
 ### Safety
 

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 from contextvars import ContextVar
+from dataclasses import replace
 from typing import Any
 
 from ..agent.graphql_agent import fetch_graphql_schema_raw
+from ..auth import resolve_headers
 from ..context import RequestContext
 from ..executor import extract_tables_from_response
 from ..graphql import execute_query as graphql_execute
@@ -44,6 +46,10 @@ async def execute_recipe_tool(
     base_url: str = "",
 ) -> str:
     """Execute a recipe by id and return JSON string."""
+    # Auth middleware: resolve token and inject into headers
+    resolved = await resolve_headers(ctx)
+    ctx = replace(ctx, target_headers=resolved)
+
     if not raw_schema:
         raw_schema, base_url = await load_schema_and_base_url(ctx)
     if not raw_schema:

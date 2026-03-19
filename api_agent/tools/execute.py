@@ -1,11 +1,13 @@
 """Unified MCP tool for direct API execution."""
 
 import json
+from dataclasses import replace
 from typing import Annotated, Any
 
 from fastmcp import FastMCP
 from pydantic import Field
 
+from ..auth import resolve_headers
 from ..config import settings
 from ..context import MissingHeaderError, get_request_context
 from ..graphql import execute_query
@@ -48,6 +50,10 @@ Use this to re-run queries from the query tool or execute known operations.""",
             ctx = get_request_context()
         except MissingHeaderError as e:
             return {"ok": False, "error": str(e)}
+
+        # Auth middleware: resolve token and inject into headers
+        resolved = await resolve_headers(ctx)
+        ctx = replace(ctx, target_headers=resolved)
 
         if ctx.api_type == "graphql":
             # GraphQL execution

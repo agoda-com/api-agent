@@ -4,11 +4,13 @@ import json
 import logging
 import re
 from contextvars import ContextVar
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
 from agents import Agent, MaxTurnsExceeded, Runner, function_tool
 
+from ..auth import resolve_headers
 from ..config import settings
 from ..context import RequestContext
 from ..executor import (
@@ -593,6 +595,10 @@ async def process_query(question: str, ctx: RequestContext) -> dict[str, Any]:
         _last_result.set([None])  # Mutable list: [result_value]
         _return_directly_flag.set([])  # Reset direct return flag
         reset_progress()  # Reset turn counter
+
+        # Auth middleware: resolve token and inject into headers
+        resolved = await resolve_headers(ctx)
+        ctx = replace(ctx, target_headers=resolved)
 
         # Fetch schema with dynamic endpoint
         schema_ctx = await _fetch_schema_context(ctx.target_url, ctx.target_headers)

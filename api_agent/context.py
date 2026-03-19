@@ -25,6 +25,9 @@ class RequestContext:
     base_url: str | None  # X-Base-URL: override base URL (REST only)
     include_result: bool  # X-Include-Result: whether to include full result in output
     poll_paths: tuple[str, ...]  # X-Poll-Paths: paths that require polling (enables poll tool)
+    auth_url: str | None = None  # X-Auth-URL: Auth0 token endpoint
+    auth_body: dict | None = None  # X-Auth-Body: credentials/grant payload (JSON)
+    auth_token_path: str = "access_token"  # X-Auth-Token-Path: dot-path to extract token
 
 
 def get_request_context() -> RequestContext:
@@ -53,6 +56,9 @@ def get_request_context() -> RequestContext:
     base_url_raw = headers.get("x-base-url")
     include_result_raw = headers.get("x-include-result", "false")
     poll_paths_raw = headers.get("x-poll-paths") or "[]"
+    auth_url_raw = headers.get("x-auth-url")
+    auth_body_raw = headers.get("x-auth-body") or "{}"
+    auth_token_path_raw = headers.get("x-auth-token-path") or "access_token"
 
     base_url = base_url_raw if base_url_raw else None
     include_result = (include_result_raw or "").lower() in ("true", "1", "yes")
@@ -81,6 +87,12 @@ def get_request_context() -> RequestContext:
     except json.JSONDecodeError:
         poll_paths = ()
 
+    auth_url = auth_url_raw if auth_url_raw else None
+    try:
+        auth_body = json.loads(auth_body_raw) if auth_url else None
+    except json.JSONDecodeError:
+        auth_body = None
+
     return RequestContext(
         target_url=target_url,
         api_type=api_type,
@@ -89,6 +101,9 @@ def get_request_context() -> RequestContext:
         base_url=base_url,
         include_result=include_result,
         poll_paths=poll_paths,
+        auth_url=auth_url,
+        auth_body=auth_body,
+        auth_token_path=auth_token_path_raw if auth_url else "access_token",
     )
 
 
