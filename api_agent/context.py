@@ -1,11 +1,23 @@
 """Request context extraction from HTTP headers."""
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
 from fastmcp.server.dependencies import get_http_headers
+
+
+_ENV_VAR_RE = re.compile(r"\$\{([^}]+)\}")
+
+
+def _expand_env_vars(value: str) -> str:
+    """Expand ``${VAR}`` references in *value* using environment variables.
+
+    Unknown variables are left as-is.
+    """
+    return _ENV_VAR_RE.sub(lambda m: os.environ.get(m.group(1), m.group(0)), value)
 
 
 class MissingHeaderError(Exception):
@@ -46,15 +58,15 @@ def get_request_context() -> RequestContext:
     """
     headers = get_http_headers()
 
-    target_url = headers.get("x-target-url")
+    target_url = _expand_env_vars(headers.get("x-target-url") or "") or None
     api_type = headers.get("x-api-type")
-    target_headers_raw = headers.get("x-target-headers") or "{}"
+    target_headers_raw = _expand_env_vars(headers.get("x-target-headers") or "{}")
     allow_unsafe_paths_raw = headers.get("x-allow-unsafe-paths") or "[]"
     base_url_raw = headers.get("x-base-url")
     include_result_raw = headers.get("x-include-result", "false")
     poll_paths_raw = headers.get("x-poll-paths") or "[]"
 
-    base_url = base_url_raw if base_url_raw else None
+    base_url = _expand_env_vars(base_url_raw) if base_url_raw else None
     include_result = (include_result_raw or "").lower() in ("true", "1", "yes")
 
     if not target_url:
