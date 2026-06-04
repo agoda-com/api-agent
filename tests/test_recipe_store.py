@@ -1,17 +1,76 @@
-"""Unit tests for recipe store utilities."""
+"""Unit tests for API Agent store utilities."""
 
 import pytest
 
-from api_agent.recipe import (
-    RECIPE_STORE,
-    RecipeStore,
-    build_recipe_context,
-    get_example_values,
-    render_param_refs,
-    render_text_template,
-)
-from api_agent.recipe.extractor import _find_used_params, _validate_equivalence
-from api_agent.recipe.store import sha256_hex
+from api_agent.recipe.contracts import validate_recipe_contract
+from api_agent.recipe.execution import render_rest_call_sets
+from api_agent.recipe.identity import recipe_fingerprint
+from api_agent.recipe.learning import should_learn_recipe
+from api_agent.recipe.search import build_recipe_context
+from api_agent.recipe.templates import render_param_refs, render_text_template
+from api_agent.store import API_AGENT_STORE, MemoryApiAgentStore, sha256_hex
+
+
+def _recipe(
+    tool_name: str = "test_recipe",
+    tool_args: dict | None = None,
+    steps: list | None = None,
+) -> dict:
+    return {
+        "public_contract": {
+            "tool_name": tool_name,
+            "description": "Use for a tested recipe. Returns rows as CSV. No required params. Do not use for different fields, joins, or workflows.",
+            "tool_args": tool_args or {},
+        },
+        "execution_plan": {
+            "steps": steps if steps is not None else [_graphql_step("users", "{ users { id } }")],
+        },
+        "validation_fixture": {"tool_args": {}},
+    }
+
+
+def _graphql_step(step_id: str, query_template: str, with_vars: dict | None = None) -> dict:
+    return {
+        "id": step_id,
+        "kind": "graphql",
+        "input": {"mode": "single", "with": with_vars or {}},
+        "call": {"query_template": query_template},
+        "output": {"name": step_id},
+    }
+
+
+def _sql_step(step_id: str, query_template: str, with_vars: dict | None = None) -> dict:
+    return {
+        "id": step_id,
+        "kind": "sql",
+        "input": {"mode": "single", "with": with_vars or {}},
+        "query_template": query_template,
+        "output": {"name": step_id},
+    }
+
+
+def _rest_step(
+    step_id: str,
+    path: str,
+    *,
+    input_spec: dict | None = None,
+    path_params: dict | None = None,
+    query_params: dict | None = None,
+    output: dict | None = None,
+) -> dict:
+    return {
+        "id": step_id,
+        "kind": "rest",
+        "input": input_spec or {"mode": "single", "with": {}},
+        "call": {
+            "method": "GET",
+            "path": path,
+            "path_params": path_params or {},
+            "query_params": query_params or {},
+            "body": {},
+        },
+        "output": output or {"name": step_id},
+    }
 
 
 def test_render_text_template_basic():
@@ -26,39 +85,212 @@ def test_sha256_hex_normalizes_json():
     assert sha256_hex(a) == sha256_hex(b)
 
 
+def test_memory_store_caches_downstream_description_by_api_and_schema():
+    store = MemoryApiAgentStore(max_size=10)
+
+    store.save_downstream_description(
+        api_id="rest:https://spec|https://api",
+        schema_hash="schema-a",
+        description="Query objectives and key results.",
+    )
+
+    assert (
+        store.get_downstream_description(
+            api_id="rest:https://spec|https://api",
+            schema_hash="schema-a",
+        )
+        == "Query objectives and key results."
+    )
+    assert (
+        store.get_downstream_description(
+            api_id="rest:https://spec|https://api",
+            schema_hash="schema-b",
+        )
+        is None
+    )
+
+
+def test_memory_store_expires_downstream_description(monkeypatch):
+    now = 1000.0
+    monkeypatch.setattr("api_agent.store.time.time", lambda: now)
+    store = MemoryApiAgentStore(max_size=10)
+
+    store.save_downstream_description(
+        api_id="rest:https://spec|https://api",
+        schema_hash="schema-a",
+        description="Query objectives and key results.",
+        ttl_seconds=10,
+    )
+
+    assert (
+        store.get_downstream_description(
+            api_id="rest:https://spec|https://api",
+            schema_hash="schema-a",
+        )
+        == "Query objectives and key results."
+    )
+    now = 1011.0
+    assert (
+        store.get_downstream_description(
+            api_id="rest:https://spec|https://api",
+            schema_hash="schema-a",
+        )
+        is None
+    )
+
+
 def test_render_param_refs_nested():
-    obj = {"a": {"$param": "x"}, "b": [{"$param": "y"}], "c": 3}
+    obj = {"a": {"$var": "x"}, "b": [{"$var": "y"}], "c": 3}
     out = render_param_refs(obj, {"x": 1, "y": "foo"})
     assert out == {"a": 1, "b": ["foo"], "c": 3}
 
 
-def test_get_example_values():
-    spec = {"limit": {"type": "int", "default": 10}, "q": {"type": "str"}}
-    params = get_example_values(spec, {"q": "abc"})
-    assert params == {"limit": 10, "q": "abc"}
+def test_render_rest_call_sets_maps_binding_rows():
+    step = _rest_step(
+        "key_results",
+        "/objectives/{id}/key-results",
+        input_spec={
+            "mode": "map",
+            "from": "objectives",
+            "bind": {"objective_id": "id"},
+            "with": {"cycle": {"value": "cycle"}},
+        },
+        path_params={"id": {"$var": "objective_id"}},
+        query_params={"cycle": {"$var": "cycle"}},
+    )
+
+    rendered, error = render_rest_call_sets(
+        step,
+        {"cycle": "Y2026Q2"},
+        {"objectives": [{"id": 10}, {"id": 11}]},
+    )
+
+    assert error == ""
+    assert [(r.path_params, r.query_params, r.body, r.binding) for r in rendered] == [
+        ({"id": 10}, {"cycle": "Y2026Q2"}, None, {"objective_id": 10}),
+        ({"id": 11}, {"cycle": "Y2026Q2"}, None, {"objective_id": 11}),
+    ]
 
 
-def test_get_example_values_none_value():
-    """None defaults are included (not skipped)."""
-    spec = {"id": {"type": "int", "default": None}, "limit": {"type": "int", "default": 10}}
-    params = get_example_values(spec, {})
-    assert params == {"id": None, "limit": 10}
-    # Provided value overrides None default
-    params2 = get_example_values(spec, {"id": 42})
-    assert params2 == {"id": 42, "limit": 10}
+def test_render_rest_call_sets_zips_fields_from_one_binding_rowset():
+    step = _rest_step(
+        "key_results",
+        "/objectives/{id}/key-results",
+        input_spec={
+            "mode": "map",
+            "from": "objective_owner_pairs",
+            "bind": {"objective_id": "id", "owner_id": "owner_id"},
+        },
+        path_params={"id": {"$var": "objective_id"}},
+        query_params={"owner": {"$var": "owner_id"}},
+    )
+
+    rendered, error = render_rest_call_sets(
+        step,
+        {},
+        {"objective_owner_pairs": [{"id": 10, "owner_id": 20}, {"id": 11, "owner_id": 21}]},
+    )
+
+    assert error == ""
+    assert [(r.path_params, r.query_params, r.binding) for r in rendered] == [
+        ({"id": 10}, {"owner": 20}, {"objective_id": 10, "owner_id": 20}),
+        ({"id": 11}, {"owner": 21}, {"objective_id": 11, "owner_id": 21}),
+    ]
+
+
+def test_render_rest_call_sets_batches_binding_rows():
+    step = _rest_step(
+        "key_results",
+        "/key-results",
+        input_spec={
+            "mode": "batch",
+            "from": "objectives",
+            "bind": {"objective_ids": "id"},
+        },
+        query_params={"ids": {"$var": "objective_ids"}},
+    )
+
+    rendered, error = render_rest_call_sets(
+        step,
+        {},
+        {"objectives": [{"id": 10}, {"id": 11}]},
+    )
+
+    assert error == ""
+    assert [(r.query_params, r.binding) for r in rendered] == [
+        ({"ids": [10, 11]}, {"objective_ids": [10, 11]})
+    ]
+
+
+def test_validate_recipe_contract_rejects_missing_binding_rowset():
+    step = _rest_step(
+        "key_results",
+        "/objectives/{id}/key-results",
+        input_spec={"mode": "map", "from": "objectives", "bind": {"objective_id": "id"}},
+        path_params={"objective_id": {"$var": "objective_id"}},
+    )
+    recipe = _recipe(
+        steps=[step],
+    )
+
+    assert validate_recipe_contract(recipe, "rest") == "step input must reference prior output"
+
+
+def test_validate_recipe_contract_rejects_duplicate_step_output():
+    recipe = _recipe(
+        steps=[
+            _rest_step("users", "/users", output={"name": "rows"}),
+            _rest_step("posts", "/posts", output={"name": "rows"}),
+        ],
+    )
+
+    assert validate_recipe_contract(recipe, "rest") == "duplicate step output"
+
+
+def test_validate_recipe_contract_rejects_batch_output_binding_attachment():
+    recipe = _recipe(
+        steps=[
+            _rest_step("objectives", "/objectives"),
+            _rest_step(
+                "key_results",
+                "/key-results",
+                input_spec={
+                    "mode": "batch",
+                    "from": "objectives",
+                    "bind": {"objective_ids": "id"},
+                },
+                query_params={"ids": {"$var": "objective_ids"}},
+                output={"name": "key_results", "attach_binding": ["objective_ids"]},
+            ),
+        ],
+    )
+
+    assert validate_recipe_contract(recipe, "rest") == "invalid output binding"
+
+
+def test_render_rest_call_sets_allows_empty_map():
+    step = _rest_step(
+        "key_results",
+        "/objectives/{id}/key-results",
+        input_spec={"mode": "map", "from": "objectives", "bind": {"objective_id": "id"}},
+        path_params={"id": {"$var": "objective_id"}},
+    )
+    rendered, error = render_rest_call_sets(step, {}, {"objectives": []})
+
+    assert error == ""
+    assert rendered == []
 
 
 def test_recipe_store_preserves_defaults():
     """Defaults are preserved as-is (no sensitivity filtering)."""
-    store = RecipeStore(max_size=10)
-    recipe = {
-        "params": {
+    store = MemoryApiAgentStore(max_size=10)
+    recipe = _recipe(
+        tool_args={
             "user_id": {"type": "str", "default": "123e4567-e89b-12d3-a456-426614174000"},
             "limit": {"type": "int", "default": 10},
         },
-        "steps": [],
-        "sql_steps": [],
-    }
+        steps=[],
+    )
     recipe_id = store.save_recipe(
         api_id="rest:https://spec|https://api",
         schema_hash="s",
@@ -69,14 +301,128 @@ def test_recipe_store_preserves_defaults():
     saved = store.get_recipe(recipe_id)
     assert saved is not None
     # Defaults preserved exactly as provided
-    assert saved["params"]["user_id"]["default"] == "123e4567-e89b-12d3-a456-426614174000"
-    assert saved["params"]["limit"]["default"] == 10
+    assert saved["public_contract"]["tool_args"]["user_id"]["default"] == (
+        "123e4567-e89b-12d3-a456-426614174000"
+    )
+    assert saved["public_contract"]["tool_args"]["limit"]["default"] == 10
+
+
+def test_recipe_store_save_is_idempotent_by_fingerprint():
+    store = MemoryApiAgentStore(max_size=10)
+    recipe = _recipe(steps=[_graphql_step("users", "{ users { id } }")])
+
+    first_id = store.save_recipe(
+        api_id="graphql:https://api.example.com/graphql",
+        schema_hash="s",
+        question="list users",
+        recipe=recipe,
+        tool_name="list_users",
+    )
+    second_id = store.save_recipe(
+        api_id="graphql:https://api.example.com/graphql",
+        schema_hash="s",
+        question="list users again",
+        recipe=recipe,
+        tool_name="list_users_duplicate",
+    )
+
+    assert second_id == first_id
+    assert (
+        len(store.list_recipes(api_id="graphql:https://api.example.com/graphql", schema_hash="s"))
+        == 1
+    )
+
+
+def test_recipe_store_fifo_eviction_does_not_promote_duplicates():
+    store = MemoryApiAgentStore(max_size=2)
+    api_id = "graphql:https://api.example.com/graphql"
+    recipes = [
+        _recipe(tool_name="a", steps=[_graphql_step("a", "{ a }")]),
+        _recipe(tool_name="b", steps=[_graphql_step("b", "{ b }")]),
+        _recipe(tool_name="c", steps=[_graphql_step("c", "{ c }")]),
+    ]
+
+    first_id = store.save_recipe(
+        api_id=api_id, schema_hash="s", question="a", recipe=recipes[0], tool_name="a"
+    )
+    store.save_recipe(
+        api_id=api_id, schema_hash="s", question="a again", recipe=recipes[0], tool_name="a"
+    )
+    second_id = store.save_recipe(
+        api_id=api_id, schema_hash="s", question="b", recipe=recipes[1], tool_name="b"
+    )
+    third_id = store.save_recipe(
+        api_id=api_id, schema_hash="s", question="c", recipe=recipes[2], tool_name="c"
+    )
+
+    ids = {r["recipe_id"] for r in store.list_recipes(api_id=api_id, schema_hash="s")}
+    assert first_id not in ids
+    assert ids == {second_id, third_id}
+
+
+def test_recipe_store_disable_hides_recipe():
+    store = MemoryApiAgentStore(max_size=10)
+    api_id = "rest:https://spec|https://api"
+    recipe = _recipe(tool_name="list_users", steps=[_rest_step("users", "/users")])
+    recipe_id = store.save_recipe(
+        api_id=api_id, schema_hash="s", question="users", recipe=recipe, tool_name="list_users"
+    )
+
+    assert store.disable_recipe(recipe_id)
+    assert store.list_recipes(api_id=api_id, schema_hash="s") == []
+    assert (
+        store.list_recipes(api_id=api_id, schema_hash="s", include_disabled=True)[0]["enabled"]
+        is False
+    )
+
+
+def test_recipe_fingerprint_normalizes_whitespace():
+    left = {
+        **_recipe(
+            steps=[
+                _graphql_step("users", "{ users { id } }"),
+                _sql_step("filtered_users", "SELECT * FROM users"),
+            ]
+        )
+    }
+    right = {
+        **_recipe(
+            steps=[
+                _graphql_step("users", "{   users { id } }"),
+                _sql_step("filtered_users", "SELECT  *   FROM users"),
+            ]
+        )
+    }
+
+    assert recipe_fingerprint(
+        api_id="graphql:x", schema_hash="s", recipe=left
+    ) == recipe_fingerprint(api_id="graphql:x", schema_hash="s", recipe=right)
+
+
+def test_recipe_fingerprint_ignores_generated_copy_and_name():
+    left = _recipe(tool_name="list_users")
+    right = _recipe(tool_name="fetch_users")
+    right["public_contract"]["description"] = (
+        "Use for fetching user ids. Returns rows as CSV. No required params. Do not use for other workflows."
+    )
+
+    assert recipe_fingerprint(
+        api_id="graphql:x", schema_hash="s", recipe=left
+    ) == recipe_fingerprint(api_id="graphql:x", schema_hash="s", recipe=right)
+
+
+def test_should_learn_recipe_rates():
+    assert not should_learn_recipe(api_id="a", schema_hash="s", question="q", learn_rate=0)
+    assert should_learn_recipe(api_id="a", schema_hash="s", question="q", learn_rate=1)
+    assert should_learn_recipe(
+        api_id="a", schema_hash="s", question="q", learn_rate=0.5
+    ) == should_learn_recipe(api_id="a", schema_hash="s", question="q", learn_rate=0.5)
 
 
 def test_recipe_store_scoring_prefers_closer_match():
-    store = RecipeStore(max_size=10)
-    r1 = {"params": {}, "steps": [], "sql_steps": []}
-    r2 = {"params": {}, "steps": [], "sql_steps": []}
+    store = MemoryApiAgentStore(max_size=10)
+    r1 = _recipe(tool_name="top_hotels", steps=[])
+    r2 = _recipe(tool_name="list_users", steps=[])
     id1 = store.save_recipe(
         api_id="rest:a|b",
         schema_hash="s",
@@ -100,9 +446,9 @@ def test_recipe_store_scoring_prefers_closer_match():
 
 
 def test_recipe_store_scoring_handles_token_order():
-    store = RecipeStore(max_size=10)
-    r1 = {"params": {}, "steps": [], "sql_steps": []}
-    r2 = {"params": {}, "steps": [], "sql_steps": []}
+    store = MemoryApiAgentStore(max_size=10)
+    r1 = _recipe(tool_name="find_hotels_in_nyc", steps=[])
+    r2 = _recipe(tool_name="find_users_in_nyc", steps=[])
     id1 = store.save_recipe(
         api_id="rest:a|b",
         schema_hash="s",
@@ -133,7 +479,7 @@ def test_render_text_template_missing_param_raises():
 
 def test_validate_recipe_params_requires_all_params():
     """All declared params are required (defaults are examples, not fallbacks)."""
-    from api_agent.recipe.common import validate_recipe_params
+    from api_agent.recipe.execution import validate_recipe_params
 
     params_spec = {
         "manager_name": {"type": "str", "default": "Alice Smith"},
@@ -146,7 +492,7 @@ def test_validate_recipe_params_requires_all_params():
 
 def test_validate_recipe_params_rejects_extra():
     """Extra params are rejected even when spec is non-empty."""
-    from api_agent.recipe.common import validate_recipe_params
+    from api_agent.recipe.execution import validate_recipe_params
 
     params_spec = {"limit": {"type": "int", "default": 10}}
     params, error = validate_recipe_params(params_spec, {"limit": 5, "extra": "bad"})
@@ -154,163 +500,27 @@ def test_validate_recipe_params_rejects_extra():
     assert "unexpected params: extra" in error
 
 
+def test_validate_recipe_params_enforces_declared_types():
+    from api_agent.recipe.execution import validate_recipe_params
+
+    params_spec = {"limit": {"type": "int", "description": "Limit"}}
+    params, error = validate_recipe_params(params_spec, {"limit": "ten"})
+    assert params is None
+    assert "invalid param type: limit must be int" in error
+
+
+def test_validate_recipe_params_coerces_declared_types():
+    from api_agent.recipe.execution import validate_recipe_params
+
+    params_spec = {"limit": {"type": "int", "description": "Limit"}}
+    params, error = validate_recipe_params(params_spec, {"limit": "10"})
+    assert error == ""
+    assert params == {"limit": 10}
+
+
 def test_global_recipe_store_available():
     # Basic smoke test to ensure singleton is constructed
-    assert RECIPE_STORE is not None
-
-
-# --- Extractor tests ---
-
-
-def test_find_used_params_graphql():
-    recipe = {
-        "params": {"limit": {"default": 10}},
-        "steps": [{"kind": "graphql", "query_template": "{ users(limit: {{limit}}) { id } }"}],
-        "sql_steps": [],
-    }
-    assert _find_used_params(recipe, "graphql") == {"limit"}
-
-
-def test_find_used_params_sql():
-    recipe = {
-        "params": {"prefix": {"default": "A"}},
-        "steps": [],
-        "sql_steps": ["SELECT * FROM t WHERE name ILIKE '{{prefix}}%'"],
-    }
-    assert _find_used_params(recipe, "graphql") == {"prefix"}
-
-
-def test_find_used_params_rest_param_refs():
-    recipe = {
-        "params": {"id": {"default": "123"}},
-        "steps": [
-            {
-                "kind": "rest",
-                "method": "GET",
-                "path": "/users/{id}",
-                "path_params": {"id": {"$param": "id"}},
-                "query_params": {},
-                "body": {},
-            }
-        ],
-        "sql_steps": [],
-    }
-    assert _find_used_params(recipe, "rest") == {"id"}
-
-
-def test_find_used_params_multiple():
-    recipe = {
-        "params": {"limit": {}, "prefix": {}},
-        "steps": [{"kind": "graphql", "query_template": "{ users(limit: {{limit}}) }"}],
-        "sql_steps": ["SELECT * WHERE name ILIKE '{{prefix}}%'"],
-    }
-    assert _find_used_params(recipe, "graphql") == {"limit", "prefix"}
-
-
-def test_find_used_params_none_used():
-    recipe = {
-        "params": {"unused": {"default": "x"}},
-        "steps": [{"kind": "graphql", "query_template": "{ users { id } }"}],
-        "sql_steps": ["SELECT * FROM t"],
-    }
-    assert _find_used_params(recipe, "graphql") == set()
-
-
-def test_validate_equivalence_graphql_valid():
-    original_steps = [{"kind": "graphql", "query": "{ users(limit: 10) { id } }", "name": "data"}]
-    original_sql = ["SELECT * FROM data WHERE active = true"]
-    recipe = {
-        "params": {"limit": {"type": "int", "default": 10}},
-        "steps": [
-            {
-                "kind": "graphql",
-                "query_template": "{ users(limit: {{limit}}) { id } }",
-                "name": "data",
-            }
-        ],
-        "sql_steps": ["SELECT * FROM data WHERE active = true"],
-    }
-    assert _validate_equivalence(
-        api_type="graphql", original_steps=original_steps, original_sql=original_sql, recipe=recipe
-    )
-
-
-def test_validate_equivalence_graphql_mismatch():
-    original_steps = [{"kind": "graphql", "query": "{ users(limit: 10) { id } }", "name": "data"}]
-    original_sql = []
-    recipe = {
-        "params": {"limit": {"type": "int", "default": 5}},  # Wrong default
-        "steps": [
-            {
-                "kind": "graphql",
-                "query_template": "{ users(limit: {{limit}}) { id } }",
-                "name": "data",
-            }
-        ],
-        "sql_steps": [],
-    }
-    assert not _validate_equivalence(
-        api_type="graphql", original_steps=original_steps, original_sql=original_sql, recipe=recipe
-    )
-
-
-def test_validate_equivalence_sql_parameterized():
-    original_steps = [{"kind": "graphql", "query": "{ teams { name } }", "name": "data"}]
-    original_sql = ["SELECT * FROM data WHERE name ILIKE 'A%'"]
-    recipe = {
-        "params": {"prefix": {"type": "str", "default": "A"}},
-        "steps": [{"kind": "graphql", "query_template": "{ teams { name } }", "name": "data"}],
-        "sql_steps": ["SELECT * FROM data WHERE name ILIKE '{{prefix}}%'"],
-    }
-    assert _validate_equivalence(
-        api_type="graphql", original_steps=original_steps, original_sql=original_sql, recipe=recipe
-    )
-
-
-def test_validate_equivalence_rest_valid():
-    original_steps = [
-        {
-            "kind": "rest",
-            "method": "GET",
-            "path": "/users",
-            "name": "data",
-            "path_params": {},
-            "query_params": {"limit": 10},
-            "body": {},
-        }
-    ]
-    original_sql = []
-    recipe = {
-        "params": {"limit": {"type": "int", "default": 10}},
-        "steps": [
-            {
-                "kind": "rest",
-                "method": "GET",
-                "path": "/users",
-                "name": "data",
-                "path_params": {},
-                "query_params": {"limit": {"$param": "limit"}},
-                "body": {},
-            }
-        ],
-        "sql_steps": [],
-    }
-    assert _validate_equivalence(
-        api_type="rest", original_steps=original_steps, original_sql=original_sql, recipe=recipe
-    )
-
-
-def test_validate_equivalence_length_mismatch():
-    original_steps = [{"kind": "graphql", "query": "{ a }", "name": "a"}]
-    original_sql = []
-    recipe = {
-        "params": {},
-        "steps": [],  # Empty - length mismatch
-        "sql_steps": [],
-    }
-    assert not _validate_equivalence(
-        api_type="graphql", original_steps=original_steps, original_sql=original_sql, recipe=recipe
-    )
+    assert API_AGENT_STORE is not None
 
 
 def test_build_recipe_context_empty():
@@ -318,19 +528,44 @@ def test_build_recipe_context_empty():
     assert build_recipe_context([]) == ""
 
 
+def _recipe_suggestion(
+    *,
+    recipe_id: str,
+    score: float,
+    question: str,
+    recipe: dict,
+    params: dict | None = None,
+    tool_name: str | None = None,
+) -> dict:
+    suggestion = {
+        "recipe_id": recipe_id,
+        "score": score,
+        "question": question,
+        "params": params or {},
+        "recipe": recipe,
+    }
+    if tool_name:
+        suggestion["tool_name"] = tool_name
+    return suggestion
+
+
 def test_build_recipe_context_with_suggestions():
     """Suggestions are formatted correctly for prompt injection."""
-    r1 = {"params": {"prefix": {"type": "str", "default": "A"}}, "steps": [], "sql_steps": []}
-    r2 = {"params": {}, "steps": [], "sql_steps": []}
+    r1 = _recipe(
+        tool_name="get_users_starting_with_a",
+        tool_args={"prefix": {"type": "str", "description": "Prefix"}},
+        steps=[],
+    )
+    r2 = _recipe(tool_name="list_all_users", steps=[])
 
-    rid1 = RECIPE_STORE.save_recipe(
+    rid1 = API_AGENT_STORE.save_recipe(
         api_id="rest:test|test",
         schema_hash="s",
         question="get users starting with A",
         recipe=r1,
         tool_name="get_users_starting_with_a",
     )
-    rid2 = RECIPE_STORE.save_recipe(
+    rid2 = API_AGENT_STORE.save_recipe(
         api_id="rest:test|test",
         schema_hash="s",
         question="list all users",
@@ -339,20 +574,21 @@ def test_build_recipe_context_with_suggestions():
     )
 
     suggestions = [
-        {
-            "recipe_id": rid1,
-            "score": 0.85,
-            "question": "get users starting with A",
-            "params": {"prefix": {"type": "str", "default": "A"}},
-            "tool_name": "get_users_starting_with_a",
-        },
-        {
-            "recipe_id": rid2,
-            "score": 0.72,
-            "question": "list all users",
-            "params": {},
-            "tool_name": "list_all_users",
-        },
+        _recipe_suggestion(
+            recipe_id=rid1,
+            score=0.85,
+            question="get users starting with A",
+            params={"prefix": {"type": "str", "description": "Prefix"}},
+            recipe=r1,
+            tool_name="get_users_starting_with_a",
+        ),
+        _recipe_suggestion(
+            recipe_id=rid2,
+            score=0.72,
+            question="list all users",
+            recipe=r2,
+            tool_name="list_all_users",
+        ),
     ]
     result = build_recipe_context(suggestions)
 
@@ -360,15 +596,15 @@ def test_build_recipe_context_with_suggestions():
     assert "</recipes>" in result
     assert "Score: 0.85" in result
     assert "get users starting with A" in result
-    assert "prefix: str = A" in result
+    assert "prefix: str" in result
     assert "Score: 0.72" in result
     assert "list all users" in result
 
 
 def test_build_recipe_context_no_params():
     """Recipes without params show empty param list."""
-    r = {"params": {}, "steps": [], "sql_steps": []}
-    rid = RECIPE_STORE.save_recipe(
+    r = _recipe(tool_name="simple_query", steps=[])
+    rid = API_AGENT_STORE.save_recipe(
         api_id="rest:test|test",
         schema_hash="s",
         question="simple query",
@@ -377,7 +613,7 @@ def test_build_recipe_context_no_params():
     )
 
     suggestions = [
-        {"recipe_id": rid, "score": 0.90, "question": "simple query", "params": {}},
+        _recipe_suggestion(recipe_id=rid, score=0.90, question="simple query", recipe=r),
     ]
     result = build_recipe_context(suggestions)
     # Tool name with no params should have empty signature
@@ -387,13 +623,16 @@ def test_build_recipe_context_no_params():
 def test_build_recipe_context_enhanced_format():
     """Enhanced context shows tool names, score hints, step summaries."""
     # Create mock recipe in store
-    # Using global RECIPE_STORE
-    recipe = {
-        "params": {"user_id": {"type": "int", "default": 123}},
-        "steps": [{"kind": "rest", "method": "GET", "path": "/users"}],
-        "sql_steps": ["SELECT * FROM data WHERE active = true"],
-    }
-    recipe_id = RECIPE_STORE.save_recipe(
+    # Using global API_AGENT_STORE
+    recipe = _recipe(
+        tool_name="get_users_recent_posts",
+        tool_args={"user_id": {"type": "int", "description": "User id"}},
+        steps=[
+            _rest_step("users", "/users"),
+            _sql_step("active_users", "SELECT * FROM users WHERE active = true"),
+        ],
+    )
+    recipe_id = API_AGENT_STORE.save_recipe(
         api_id="rest:test|test",
         schema_hash="test_hash",
         question="Get user's recent posts",
@@ -402,12 +641,13 @@ def test_build_recipe_context_enhanced_format():
     )
 
     suggestions = [
-        {
-            "recipe_id": recipe_id,
-            "score": 0.85,
-            "question": "Get user's recent posts",
-            "params": {"user_id": {"type": "int", "default": 123}},
-        }
+        _recipe_suggestion(
+            recipe_id=recipe_id,
+            score=0.85,
+            question="Get user's recent posts",
+            params={"user_id": {"type": "int", "description": "User id"}},
+            recipe=recipe,
+        )
     ]
 
     result = build_recipe_context(suggestions)
@@ -415,7 +655,7 @@ def test_build_recipe_context_enhanced_format():
     # Check new format elements
     assert "Available recipe tools" in result
     assert "get_users_recent_posts" in result  # Sanitized tool name
-    assert "user_id: int = 123" in result  # Typed param signature
+    assert "user_id: int" in result  # Typed param signature
     assert "Score: 0.85" in result
     assert "STRONG MATCH" in result  # Score >= 0.8
     assert "1 API call + 1 SQL step" in result  # Step summary
@@ -423,11 +663,11 @@ def test_build_recipe_context_enhanced_format():
 
 def test_build_recipe_context_score_hints():
     """Test different score interpretation hints."""
-    # Using global RECIPE_STORE
-    recipe = {"params": {}, "steps": [], "sql_steps": []}
+    # Using global API_AGENT_STORE
+    recipe = _recipe(steps=[])
 
     # High score
-    rid1 = RECIPE_STORE.save_recipe(
+    rid1 = API_AGENT_STORE.save_recipe(
         api_id="rest:a|b",
         schema_hash="s",
         question="high score query",
@@ -435,7 +675,7 @@ def test_build_recipe_context_score_hints():
         tool_name="high_score_query",
     )
     # Medium score
-    rid2 = RECIPE_STORE.save_recipe(
+    rid2 = API_AGENT_STORE.save_recipe(
         api_id="rest:a|b",
         schema_hash="s",
         question="medium score query",
@@ -443,7 +683,7 @@ def test_build_recipe_context_score_hints():
         tool_name="medium_score_query",
     )
     # Low score
-    rid3 = RECIPE_STORE.save_recipe(
+    rid3 = API_AGENT_STORE.save_recipe(
         api_id="rest:a|b",
         schema_hash="s",
         question="low score query",
@@ -452,9 +692,11 @@ def test_build_recipe_context_score_hints():
     )
 
     suggestions = [
-        {"recipe_id": rid1, "score": 0.92, "question": "high score query", "params": {}},
-        {"recipe_id": rid2, "score": 0.68, "question": "medium score query", "params": {}},
-        {"recipe_id": rid3, "score": 0.45, "question": "low score query", "params": {}},
+        _recipe_suggestion(recipe_id=rid1, score=0.92, question="high score query", recipe=recipe),
+        _recipe_suggestion(
+            recipe_id=rid2, score=0.68, question="medium score query", recipe=recipe
+        ),
+        _recipe_suggestion(recipe_id=rid3, score=0.45, question="low score query", recipe=recipe),
     ]
 
     result = build_recipe_context(suggestions)
@@ -466,43 +708,47 @@ def test_build_recipe_context_score_hints():
 
 def test_build_recipe_context_step_summaries():
     """Test step summary formatting."""
-    # Using global RECIPE_STORE
+    # Using global API_AGENT_STORE
 
     # API only
-    r1 = {"params": {}, "steps": [{"kind": "rest"}], "sql_steps": []}
+    r1 = _recipe(tool_name="api_only", steps=[_rest_step("users", "/users")])
     # SQL only
-    r2 = {"params": {}, "steps": [], "sql_steps": ["SELECT * FROM t"]}
+    r2 = _recipe(tool_name="sql_only", steps=[_sql_step("rows", "SELECT * FROM t")])
     # Both
-    r3 = {
-        "params": {},
-        "steps": [{"kind": "rest"}, {"kind": "rest"}],
-        "sql_steps": ["SQL1", "SQL2"],
-    }
+    r3 = _recipe(
+        tool_name="both",
+        steps=[
+            _rest_step("users", "/users"),
+            _rest_step("posts", "/posts"),
+            _sql_step("sql1", "SQL1"),
+            _sql_step("sql2", "SQL2"),
+        ],
+    )
     # Neither
-    r4 = {"params": {}, "steps": [], "sql_steps": []}
+    r4 = _recipe(tool_name="neither", steps=[])
 
-    rid1 = RECIPE_STORE.save_recipe(
+    rid1 = API_AGENT_STORE.save_recipe(
         api_id="rest:a|b",
         schema_hash="s",
         question="api only",
         recipe=r1,
         tool_name="api_only",
     )
-    rid2 = RECIPE_STORE.save_recipe(
+    rid2 = API_AGENT_STORE.save_recipe(
         api_id="rest:a|b",
         schema_hash="s",
         question="sql only",
         recipe=r2,
         tool_name="sql_only",
     )
-    rid3 = RECIPE_STORE.save_recipe(
+    rid3 = API_AGENT_STORE.save_recipe(
         api_id="rest:a|b",
         schema_hash="s",
         question="both",
         recipe=r3,
         tool_name="both",
     )
-    rid4 = RECIPE_STORE.save_recipe(
+    rid4 = API_AGENT_STORE.save_recipe(
         api_id="rest:a|b",
         schema_hash="s",
         question="neither",
@@ -511,10 +757,10 @@ def test_build_recipe_context_step_summaries():
     )
 
     suggestions = [
-        {"recipe_id": rid1, "score": 0.7, "question": "api only", "params": {}},
-        {"recipe_id": rid2, "score": 0.7, "question": "sql only", "params": {}},
-        {"recipe_id": rid3, "score": 0.7, "question": "both", "params": {}},
-        {"recipe_id": rid4, "score": 0.7, "question": "neither", "params": {}},
+        _recipe_suggestion(recipe_id=rid1, score=0.7, question="api only", recipe=r1),
+        _recipe_suggestion(recipe_id=rid2, score=0.7, question="sql only", recipe=r2),
+        _recipe_suggestion(recipe_id=rid3, score=0.7, question="both", recipe=r3),
+        _recipe_suggestion(recipe_id=rid4, score=0.7, question="neither", recipe=r4),
     ]
 
     result = build_recipe_context(suggestions)
@@ -525,21 +771,29 @@ def test_build_recipe_context_step_summaries():
     assert "no steps" in result
 
 
-def test_validate_and_prepare_recipe_success():
-    """validate_and_prepare_recipe returns recipe and params."""
+@pytest.mark.asyncio
+async def test_validate_and_prepare_recipe_success():
+    """async_validate_and_prepare_recipe returns recipe and params."""
     from contextvars import ContextVar
 
-    from api_agent.recipe import RECIPE_STORE, validate_and_prepare_recipe
+    from api_agent.recipe.learning import async_validate_and_prepare_recipe
+    from api_agent.store import API_AGENT_STORE
 
     schema_var: ContextVar[str] = ContextVar("schema")
     schema_var.set('{"type": "test"}')
 
-    recipe = {
-        "params": {"limit": {"type": "int", "default": 10}},
-        "steps": [{"kind": "graphql", "query_template": "{ users }"}],
-        "sql_steps": [],
-    }
-    rid = RECIPE_STORE.save_recipe(
+    recipe = _recipe(
+        tool_name="get_users",
+        tool_args={"limit": {"type": "int", "description": "Limit"}},
+        steps=[
+            _graphql_step(
+                "users",
+                "{ users(limit: {{limit}}) { id } }",
+                {"limit": {"value": "limit"}},
+            )
+        ],
+    )
+    rid = API_AGENT_STORE.save_recipe(
         api_id="graphql:test",
         schema_hash="abc",
         question="get users",
@@ -547,36 +801,38 @@ def test_validate_and_prepare_recipe_success():
         tool_name="get_users",
     )
 
-    result, params, error = validate_and_prepare_recipe(rid, '{"limit": 5}', schema_var)
+    result, params, error = await async_validate_and_prepare_recipe(rid, '{"limit": 5}', schema_var)
     assert error == ""
     assert result is not None
     assert params == {"limit": 5}
 
 
-def test_validate_and_prepare_recipe_not_found():
-    """validate_and_prepare_recipe returns error for missing recipe."""
+@pytest.mark.asyncio
+async def test_validate_and_prepare_recipe_not_found():
+    """async_validate_and_prepare_recipe returns error for missing recipe."""
     from contextvars import ContextVar
 
-    from api_agent.recipe import validate_and_prepare_recipe
+    from api_agent.recipe.learning import async_validate_and_prepare_recipe
 
     schema_var: ContextVar[str] = ContextVar("schema")
     schema_var.set('{"type": "test"}')
 
-    result, params, error = validate_and_prepare_recipe("nonexistent", "{}", schema_var)
+    result, params, error = await async_validate_and_prepare_recipe("nonexistent", "{}", schema_var)
     assert result is None
     assert params is None
     assert "not found" in error
 
 
-def test_validate_and_prepare_recipe_no_schema():
-    """validate_and_prepare_recipe returns error when schema not loaded."""
+@pytest.mark.asyncio
+async def test_validate_and_prepare_recipe_no_schema():
+    """async_validate_and_prepare_recipe returns error when schema not loaded."""
     from contextvars import ContextVar
 
-    from api_agent.recipe import validate_and_prepare_recipe
+    from api_agent.recipe.learning import async_validate_and_prepare_recipe
 
     schema_var: ContextVar[str] = ContextVar("schema")  # Not set
 
-    result, params, error = validate_and_prepare_recipe("r_123", "{}", schema_var)
+    result, params, error = await async_validate_and_prepare_recipe("r_123", "{}", schema_var)
     assert result is None
     assert "schema not loaded" in error
 
@@ -586,17 +842,19 @@ async def test_execute_recipe_steps_returns_executed_sql():
     """execute_recipe_steps returns executed SQL list."""
     from contextvars import ContextVar
 
-    from api_agent.recipe.common import execute_recipe_steps
+    from api_agent.recipe.execution import execute_recipe_steps
 
     query_results: ContextVar[dict] = ContextVar("qr")
     last_result: ContextVar[list] = ContextVar("lr")
     query_results.set({"data": [{"id": 1, "name": "test"}]})
     last_result.set([None])
 
-    recipe = {
-        "steps": [],
-        "sql_steps": ["SELECT * FROM data", "SELECT id FROM data WHERE id = 1"],
-    }
+    recipe = _recipe(
+        steps=[
+            _sql_step("data_rows", "SELECT * FROM data"),
+            _sql_step("first_data_row", "SELECT id FROM data WHERE id = 1"),
+        ],
+    )
 
     executed_items: list = []
 
@@ -624,17 +882,19 @@ async def test_execute_recipe_steps_with_api_and_sql():
     """execute_recipe_steps executes both API and SQL steps."""
     from contextvars import ContextVar
 
-    from api_agent.recipe.common import execute_recipe_steps
+    from api_agent.recipe.execution import execute_recipe_steps
 
     query_results: ContextVar[dict] = ContextVar("qr")
     last_result: ContextVar[list] = ContextVar("lr")
     query_results.set({})
     last_result.set([None])
 
-    recipe = {
-        "steps": [{"kind": "test", "name": "step1"}],
-        "sql_steps": ["SELECT * FROM step1"],
-    }
+    recipe = _recipe(
+        steps=[
+            {"kind": "test", "name": "step1"},
+            _sql_step("step1_rows", "SELECT * FROM step1"),
+        ],
+    )
 
     executed_items: list = []
     executor_calls: list = []
@@ -661,21 +921,122 @@ async def test_execute_recipe_steps_with_api_and_sql():
 
 
 @pytest.mark.asyncio
-async def test_execute_recipe_steps_api_failure():
-    """execute_recipe_steps returns empty sql on API failure."""
+async def test_execute_recipe_steps_preserves_interleaved_order():
+    """SQL steps can run between API steps and expose named SQL results."""
     from contextvars import ContextVar
 
-    from api_agent.recipe.common import execute_recipe_steps
+    from api_agent.recipe.execution import execute_recipe_steps
 
     query_results: ContextVar[dict] = ContextVar("qr")
     last_result: ContextVar[list] = ContextVar("lr")
     query_results.set({})
     last_result.set([None])
 
-    recipe = {
-        "steps": [{"kind": "test"}],
-        "sql_steps": ["SELECT * FROM data"],
+    recipe = _recipe(
+        steps=[
+            {"kind": "test", "name": "source"},
+            _sql_step("filtered", "SELECT id FROM source WHERE id = 2"),
+            {"kind": "test", "name": "after_sql"},
+        ],
+    )
+
+    executed_items: list = []
+    executor_calls: list = []
+
+    async def mock_executor(idx, step, params, results):
+        executor_calls.append(step["name"])
+        if step["name"] == "source":
+            results["source"] = [{"id": 1}, {"id": 2}]
+            return True, results["source"], "", {"call": "source"}
+        assert results["filtered"] == [{"id": 2}]
+        results["after_sql"] = [{"ok": True}]
+        return True, results["after_sql"], "", {"call": "after_sql"}
+
+    success, last_data, executed_sql, error = await execute_recipe_steps(
+        recipe,
+        {},
+        query_results,
+        last_result,
+        mock_executor,
+        executed_items,
+    )
+
+    assert success is True
+    assert error == ""
+    assert executor_calls == ["source", "after_sql"]
+    assert executed_items == [{"call": "source"}, {"call": "after_sql"}]
+    assert executed_sql == ["SELECT id FROM source WHERE id = 2"]
+    assert last_data == [{"ok": True}]
+
+
+@pytest.mark.asyncio
+async def test_execute_recipe_steps_allows_mapped_step_executor_to_resolve_bindings():
+    from contextvars import ContextVar
+
+    from api_agent.recipe.execution import build_step_input_sets, execute_recipe_steps
+
+    query_results: ContextVar[dict] = ContextVar("qr")
+    last_result: ContextVar[list] = ContextVar("lr")
+    query_results.set({})
+    last_result.set([None])
+
+    mapped_step = {
+        "kind": "test",
+        "name": "key_results",
+        "input": {
+            "mode": "map",
+            "from": "filtered_objectives",
+            "bind": {"objective_id": "id"},
+        },
     }
+    recipe = _recipe(
+        steps=[
+            {"kind": "test", "name": "objectives"},
+            _sql_step("filtered_objectives", "SELECT id FROM objectives WHERE id > 1 ORDER BY id"),
+            mapped_step,
+        ],
+    )
+
+    executor_params: list[dict] = []
+
+    async def mock_executor(_idx, step, params, results):
+        if step["name"] == "objectives":
+            results["objectives"] = [{"id": 1}, {"id": 2}, {"id": 3}]
+            return True, results["objectives"], "", {"call": "objectives"}
+        input_sets, input_error = build_step_input_sets(step, params, results)
+        assert input_error == ""
+        executor_params.extend([input_set.params for input_set in input_sets])
+        return True, [{"objective_id": 2}, {"objective_id": 3}], "", {"call": "key_results"}
+
+    success, last_data, executed_sql, error = await execute_recipe_steps(
+        recipe,
+        {},
+        query_results,
+        last_result,
+        mock_executor,
+        [],
+    )
+
+    assert success is True
+    assert error == ""
+    assert executed_sql == ["SELECT id FROM objectives WHERE id > 1 ORDER BY id"]
+    assert executor_params == [{"objective_id": 2}, {"objective_id": 3}]
+    assert last_data == [{"objective_id": 2}, {"objective_id": 3}]
+
+
+@pytest.mark.asyncio
+async def test_execute_recipe_steps_api_failure():
+    """execute_recipe_steps returns empty sql on API failure."""
+    from contextvars import ContextVar
+
+    from api_agent.recipe.execution import execute_recipe_steps
+
+    query_results: ContextVar[dict] = ContextVar("qr")
+    last_result: ContextVar[list] = ContextVar("lr")
+    query_results.set({})
+    last_result.set([None])
+
+    recipe = _recipe(steps=[{"kind": "test"}])
 
     async def failing_executor(idx, step, params, results):
         return False, None, '{"error": "api failed"}', None
@@ -694,6 +1055,42 @@ async def test_execute_recipe_steps_api_failure():
     assert "api failed" in error
 
 
+@pytest.mark.asyncio
+async def test_execute_recipe_steps_api_failure_after_sql_keeps_executed_sql():
+    from contextvars import ContextVar
+
+    from api_agent.recipe.execution import execute_recipe_steps
+
+    query_results: ContextVar[dict] = ContextVar("qr")
+    last_result: ContextVar[list] = ContextVar("lr")
+    query_results.set({"data": [{"id": 1}]})
+    last_result.set([None])
+
+    recipe = _recipe(
+        steps=[
+            _sql_step("data_ids", "SELECT id FROM data"),
+            {"kind": "test"},
+        ],
+    )
+
+    async def failing_executor(idx, step, params, results):
+        return False, None, '{"error": "api failed"}', None
+
+    success, last_data, executed_sql, error = await execute_recipe_steps(
+        recipe,
+        {},
+        query_results,
+        last_result,
+        failing_executor,
+        [],
+    )
+
+    assert success is False
+    assert last_data is None
+    assert executed_sql == ["SELECT id FROM data"]
+    assert "api failed" in error
+
+
 # --- sanitize_tool_name tests ---
 
 
@@ -706,7 +1103,7 @@ class TestSanitizeToolName:
     def test_special_chars_stripped(self):
         from api_agent.recipe.naming import sanitize_tool_name
 
-        assert sanitize_tool_name("get-users!@#v2") == "getusersv2"
+        assert sanitize_tool_name("get-users!@#beta") == "get_users_beta"
 
     def test_spaces_to_underscores(self):
         from api_agent.recipe.naming import sanitize_tool_name
@@ -729,117 +1126,13 @@ class TestSanitizeToolName:
 
         assert sanitize_tool_name("  _hello_  ") == "hello"
 
+    def test_reserved_prefixes_removed(self):
+        from api_agent.recipe.naming import sanitize_tool_name
 
-# --- _recipes_equivalent tests ---
+        assert sanitize_tool_name("r_list_users") == "list_users"
+        assert sanitize_tool_name("api_get_users") == "get_users"
 
+    def test_digit_prefix_gets_safe_slug(self):
+        from api_agent.recipe.naming import sanitize_tool_name
 
-class TestRecipesEquivalent:
-    def test_identical_graphql(self):
-        from api_agent.recipe.common import _recipes_equivalent
-
-        r = {
-            "params": {"limit": {"type": "int"}},
-            "steps": [{"kind": "graphql", "name": "users", "query_template": "{ users }"}],
-            "sql_steps": ["SELECT * FROM users"],
-        }
-        assert _recipes_equivalent(r, dict(r), "graphql") is True
-
-    def test_whitespace_normalized_graphql(self):
-        from api_agent.recipe.common import _recipes_equivalent
-
-        a = {
-            "params": {},
-            "steps": [{"kind": "graphql", "name": "d", "query_template": "{  users\n{ id } }"}],
-            "sql_steps": [],
-        }
-        b = {
-            "params": {},
-            "steps": [{"kind": "graphql", "name": "d", "query_template": "{ users { id } }"}],
-            "sql_steps": [],
-        }
-        assert _recipes_equivalent(a, b, "graphql") is True
-
-    def test_different_params(self):
-        from api_agent.recipe.common import _recipes_equivalent
-
-        a = {"params": {"x": {"type": "int"}}, "steps": [], "sql_steps": []}
-        b = {"params": {"y": {"type": "int"}}, "steps": [], "sql_steps": []}
-        assert _recipes_equivalent(a, b, "graphql") is False
-
-    def test_different_step_count(self):
-        from api_agent.recipe.common import _recipes_equivalent
-
-        a = {
-            "params": {},
-            "steps": [{"kind": "graphql", "name": "a", "query_template": "q"}],
-            "sql_steps": [],
-        }
-        b = {"params": {}, "steps": [], "sql_steps": []}
-        assert _recipes_equivalent(a, b, "graphql") is False
-
-    def test_rest_step_fields(self):
-        from api_agent.recipe.common import _recipes_equivalent
-
-        base = {
-            "kind": "rest",
-            "name": "d",
-            "method": "GET",
-            "path": "/a",
-            "path_params": {},
-            "query_params": {},
-            "body": {},
-        }
-        a = {"params": {}, "steps": [base], "sql_steps": []}
-        b_step = {**base, "path": "/b"}
-        b = {"params": {}, "steps": [b_step], "sql_steps": []}
-        assert _recipes_equivalent(a, b, "rest") is False
-
-    def test_sql_whitespace_normalized(self):
-        from api_agent.recipe.common import _recipes_equivalent
-
-        a = {"params": {}, "steps": [], "sql_steps": ["SELECT *  FROM   t"]}
-        b = {"params": {}, "steps": [], "sql_steps": ["SELECT * FROM t"]}
-        assert _recipes_equivalent(a, b, "graphql") is True
-
-
-# --- recipe change tracking tests ---
-
-
-class TestRecipeChangeTracking:
-    def test_consume_empty(self):
-        from api_agent.recipe.common import consume_recipe_changes, reset_recipe_change_flag
-
-        reset_recipe_change_flag()
-        assert consume_recipe_changes() == []
-
-    def test_mark_and_consume(self):
-        from api_agent.recipe.common import (
-            consume_recipe_changes,
-            mark_recipe_changed,
-            reset_recipe_change_flag,
-        )
-
-        reset_recipe_change_flag()
-        mark_recipe_changed("r_1")
-        mark_recipe_changed("r_2")
-        changes = consume_recipe_changes()
-        assert changes == ["r_1", "r_2"]
-        # second consume should be empty
-        assert consume_recipe_changes() == []
-
-    def test_consume_without_reset(self):
-        """consume_recipe_changes works even without prior reset."""
-        import contextvars
-
-        from api_agent.recipe.common import consume_recipe_changes, mark_recipe_changed
-
-        # Force fresh ContextVar state by operating in a new context
-
-        ctx = contextvars.copy_context()
-
-        def _inner():
-            mark_recipe_changed("r_x")
-            return consume_recipe_changes()
-
-        result = ctx.run(_inner)
-        assert result == ["r_x"]
+        assert sanitize_tool_name("123 hotels") == "recipe_123_hotels"

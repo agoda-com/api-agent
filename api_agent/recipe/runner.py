@@ -2,25 +2,30 @@
 
 from __future__ import annotations
 
-import json
 from contextvars import ContextVar
 from typing import Any
 
 from ..agent.graphql_agent import fetch_graphql_schema_raw
 from ..context import RequestContext
-from ..executor import extract_tables_from_response
 from ..graphql import execute_query as graphql_execute
 from ..rest.client import execute_request
 from ..rest.schema_loader import fetch_schema_context
+from ..store import ASYNC_API_AGENT_STORE, sha256_hex
 from ..utils.csv import to_csv
-from .common import (
-    build_api_id,
+from .contracts import get_recipe_tool_args, has_recipe_contract, resolve_recipe_values
+from .execution import (
+    build_rest_call_record,
+    collect_step_rows,
     error_json,
     execute_recipe_steps,
     format_recipe_response,
+    get_rest_step_call,
+    render_graphql_query_sets,
+    render_rest_call_sets,
+    store_step_rows,
     validate_recipe_params,
 )
-from .store import RECIPE_STORE, render_param_refs, render_text_template, sha256_hex
+from .search import build_api_id
 
 
 async def load_schema_and_base_url(ctx: RequestContext) -> tuple[str, str]:
@@ -49,7 +54,7 @@ async def execute_recipe_tool(
     if not raw_schema:
         return error_json("schema not loaded")
 
-    meta = RECIPE_STORE.get_recipe_meta(recipe_id)
+    meta = await ASYNC_API_AGENT_STORE.get_recipe_meta(recipe_id)
     if not meta:
         return error_json(f"recipe not found: {recipe_id}")
 
@@ -59,11 +64,16 @@ async def execute_recipe_tool(
         return error_json("recipe does not match current API or schema")
 
     recipe = meta.get("recipe") or {}
-    params_spec = recipe.get("params", {})
+    if not has_recipe_contract(recipe):
+        return error_json(f"recipe not found: {recipe_id}")
+    params_spec = get_recipe_tool_args(recipe)
     provided = params or {}
-    validated_params, error = validate_recipe_params(params_spec, provided)
+    validated_public_args, error = validate_recipe_params(params_spec, provided)
     if error:
         return error
+    execution_params, error = resolve_recipe_values(recipe, validated_public_args or {})
+    if error:
+        return error_json(error)
 
     # Initialize storage for results
     query_results_var: ContextVar[dict[str, Any]] = ContextVar("recipe_query_results")
@@ -78,25 +88,28 @@ async def execute_recipe_tool(
             if not isinstance(step, dict) or step.get("kind") != "graphql":
                 return False, None, error_json("invalid recipe step"), None
 
-            name = step.get("name") or "data"
-            tmpl = step.get("query_template")
-            if not isinstance(tmpl, str):
-                return False, None, error_json("missing query_template"), None
+            rendered_queries, render_error = render_graphql_query_sets(step, params, results)
+            if render_error:
+                return False, None, error_json(render_error), None
 
-            query = render_text_template(tmpl, params)
-            res = await graphql_execute(query, None, ctx.target_url, ctx.target_headers)
-            if not res.get("success"):
-                return False, None, error_json(res.get("error", "query failed")), None
+            combined_rows: list[Any] = []
+            queries: list[str] = []
+            for rendered in rendered_queries:
+                query = rendered.query
+                res = await graphql_execute(query, None, ctx.target_url, ctx.target_headers)
+                if not res.get("success"):
+                    return False, None, error_json(res.get("error", "query failed")), None
 
-            data = res.get("data", {})
-            tables, _ = extract_tables_from_response(data, str(name))
-            results.update(tables)
+                combined_rows.extend(collect_step_rows(res.get("data", {}), step, rendered.binding))
+                queries.append(query)
+
+            store_step_rows(results, step, combined_rows)
             query_results_var.set(results)
-            return True, tables.get(str(name)), "", query
+            return True, combined_rows, "", queries
 
         success, last_data, executed_sql, error = await execute_recipe_steps(
             recipe,
-            validated_params or {},
+            execution_params or {},
             query_results_var,
             last_result_var,
             graphql_step_executor,
@@ -121,53 +134,41 @@ async def execute_recipe_tool(
         if not isinstance(step, dict) or step.get("kind") != "rest":
             return False, None, error_json("invalid recipe step"), None
 
-        method = str(step.get("method", "GET")).upper()
-        path = str(step.get("path", ""))
-        name = str(step.get("name") or "data")
+        method, path, name = get_rest_step_call(step)
 
-        try:
-            pp = render_param_refs(step.get("path_params") or {}, params)
-            qp = render_param_refs(step.get("query_params") or {}, params)
-            bd = render_param_refs(step.get("body") or {}, params)
-        except KeyError as e:
-            return False, None, error_json(str(e)), None
+        rendered_sets, render_error = render_rest_call_sets(step, params, results)
+        if render_error:
+            return False, None, error_json(render_error), None
 
-        path_params = pp if isinstance(pp, dict) else None
-        query_params = qp if isinstance(qp, dict) else None
-        body = bd if isinstance(bd, dict) and bd else None
+        combined_rows: list[Any] = []
+        call_recs: list[dict[str, Any]] = []
+        for rendered in rendered_sets:
+            res = await execute_request(
+                method,
+                path,
+                rendered.path_params,
+                rendered.query_params,
+                rendered.body,
+                base_url=base_url,
+                headers=ctx.target_headers,
+                allow_unsafe_paths=list(ctx.allow_unsafe_paths),
+            )
+            if not res.get("success"):
+                return False, None, error_json(res.get("error", "request failed")), None
 
-        res = await execute_request(
-            method,
-            path,
-            path_params,
-            query_params,
-            body,
-            base_url=base_url,
-            headers=ctx.target_headers,
-            allow_unsafe_paths=list(ctx.allow_unsafe_paths),
-        )
-        if not res.get("success"):
-            return False, None, error_json(res.get("error", "request failed")), None
+            combined_rows.extend(collect_step_rows(res.get("data", {}), step, rendered.binding))
 
-        data = res.get("data", {})
-        tables, _ = extract_tables_from_response(data, name)
-        results.update(tables)
+            call_recs.append(
+                build_rest_call_record(method=method, path=path, name=name, rendered=rendered)
+            )
+
+        store_step_rows(results, step, combined_rows)
         query_results_var.set(results)
-
-        call_rec = {
-            "method": method,
-            "path": path,
-            "path_params": json.dumps(path_params) if path_params else "",
-            "query_params": json.dumps(query_params) if query_params else "",
-            "body": json.dumps(body) if body else "",
-            "name": name,
-            "success": True,
-        }
-        return True, tables.get(name), "", call_rec
+        return True, combined_rows, "", call_recs
 
     success, last_data, executed_sql, error = await execute_recipe_steps(
         recipe,
-        validated_params or {},
+        execution_params or {},
         query_results_var,
         last_result_var,
         rest_step_executor,

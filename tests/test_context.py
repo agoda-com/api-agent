@@ -11,11 +11,48 @@ from api_agent.context import (
     get_full_hostname,
     get_request_context,
     get_tool_name_prefix,
+    parse_request_context,
 )
 
 
 class TestGetRequestContext:
     """Test header extraction and validation."""
+
+    def test_parse_request_context_is_pure(self):
+        ctx = parse_request_context(
+            {
+                "x-target-url": "https://api.example.com/openapi.json",
+                "x-api-type": "rest",
+                "x-target-headers": '{"Authorization": "Bearer xxx"}',
+                "x-base-url": "https://api.example.com/v1",
+                "x-allow-unsafe-paths": '["/search"]',
+                "x-poll-paths": '["/jobs"]',
+                "x-recipe-learn-rate": "1",
+                "x-debug": "true",
+            }
+        )
+
+        assert ctx.target_url == "https://api.example.com/openapi.json"
+        assert ctx.api_type == "rest"
+        assert ctx.target_headers == {"Authorization": "Bearer xxx"}
+        assert ctx.base_url == "https://api.example.com/v1"
+        assert ctx.allow_unsafe_paths == ("/search",)
+        assert ctx.include_result is False
+        assert ctx.poll_paths == ("/jobs",)
+        assert ctx.learning_rate == 1.0
+        assert ctx.debug is True
+
+    def test_learning_rate_rejects_invalid_values(self):
+        headers = {
+            "x-target-url": "https://api.example.com/openapi.json",
+            "x-api-type": "rest",
+        }
+
+        with pytest.raises(MissingHeaderError, match="X-Recipe-Learn-Rate"):
+            parse_request_context({**headers, "x-recipe-learn-rate": "always"})
+
+        with pytest.raises(MissingHeaderError, match="between 0 and 1"):
+            parse_request_context({**headers, "x-recipe-learn-rate": "1.2"})
 
     @patch("api_agent.context.get_http_headers")
     def test_extracts_all_headers(self, mock_headers):
@@ -111,6 +148,57 @@ class TestGetRequestContext:
         ctx = get_request_context()
         assert ctx.target_url == "https://api.example.com"
 
+    @patch("api_agent.context.get_http_headers")
+    def test_passthrough_headers_merged(self, mock_headers):
+        mock_headers.return_value = {
+            "x-target-url": "https://api.example.com/graphql",
+            "x-api-type": "graphql",
+            "x-target-headers": '{"X-Api-Key": "from-json"}',
+            "x-passthrough-headers": '["x-request-id", "x-correlation-id"]',
+            "x-request-id": "req-abc",
+            "x-correlation-id": "corr-xyz",
+        }
+        ctx = get_request_context()
+        assert ctx.target_headers == {
+            "X-Api-Key": "from-json",
+            "X-Request-Id": "req-abc",
+            "X-Correlation-Id": "corr-xyz",
+        }
+
+    @patch("api_agent.context.get_http_headers")
+    def test_passthrough_headers_invalid_json_ignored(self, mock_headers):
+        mock_headers.return_value = {
+            "x-target-url": "https://api.example.com/graphql",
+            "x-api-type": "graphql",
+            "x-passthrough-headers": "not-json",
+            "x-request-id": "req-abc",
+        }
+        ctx = get_request_context()
+        assert ctx.target_headers == {}
+
+    @patch("api_agent.context.get_http_headers")
+    def test_passthrough_headers_forwards_authorization_when_listed(self, mock_headers):
+        mock_headers.return_value = {
+            "x-target-url": "https://api.example.com/graphql",
+            "x-api-type": "graphql",
+            "x-passthrough-headers": '["authorization"]',
+            "authorization": "Bearer from-client",
+        }
+        ctx = get_request_context()
+        assert ctx.target_headers == {"Authorization": "Bearer from-client"}
+        mock_headers.assert_called_once_with(include={"authorization"})
+
+    @patch("api_agent.context.get_http_headers")
+    def test_passthrough_skips_missing_headers(self, mock_headers):
+        mock_headers.return_value = {
+            "x-target-url": "https://api.example.com/graphql",
+            "x-api-type": "graphql",
+            "x-passthrough-headers": '["x-missing", "x-request-id"]',
+            "x-request-id": "only-this",
+        }
+        ctx = get_request_context()
+        assert ctx.target_headers == {"X-Request-Id": "only-this"}
+
 
 class TestRequestContext:
     """Test RequestContext dataclass."""
@@ -126,7 +214,7 @@ class TestRequestContext:
             poll_paths=(),
         )
         with pytest.raises(Exception):  # FrozenInstanceError
-            ctx.target_url = "new"  # type: ignore[misc]  # intentional write to frozen field
+            ctx.target_url = "new"  # ty: ignore[invalid-assignment]  # intentional write to frozen field
 
 
 class TestBaseUrl:
@@ -246,9 +334,9 @@ class TestGetToolNamePrefix:
         assert result == "example"  # skips 'api' and 'com'
 
     def test_complex_subdomain(self):
-        url = "https://flights-api-qa.internal.example.com/openapi.json"
+        url = "https://flights-service.internal.example.com/openapi.json"
         result = get_tool_name_prefix(url)
-        assert result == "flights_api_qa_example"  # skips internal, com
+        assert result == "flights_service_example"  # skips internal, com
 
     def test_consistent_result(self):
         url = "https://api.example.com/openapi.json"
@@ -258,7 +346,7 @@ class TestGetToolNamePrefix:
 
     def test_different_urls_different_result(self):
         url1 = "https://api.example.com/openapi.json"
-        url2 = "https://api.stripe.com/openapi.json"
+        url2 = "https://payments.example.net/openapi.json"
         assert get_tool_name_prefix(url1) != get_tool_name_prefix(url2)
 
     def test_empty_url(self):
@@ -277,8 +365,8 @@ class TestGetFullHostname:
     """Test full hostname extraction for descriptions."""
 
     def test_extracts_hostname(self):
-        url = "https://flights-api-qa.example.com/openapi.json"
-        assert get_full_hostname(url) == "flights-api-qa.example.com"
+        url = "https://flights-service.example.com/openapi.json"
+        assert get_full_hostname(url) == "flights-service.example.com"
 
     def test_empty_url(self):
         assert get_full_hostname("") == "api"
@@ -296,6 +384,13 @@ class TestExtractApiName:
             "x-target-url": "https://other-api.example.com",
         }
         assert extract_api_name(headers) == "my_custom_api"
+
+    def test_explicit_header_preserves_hyphen(self):
+        headers = {
+            "x-api-name": "weather-alerts",
+            "x-target-url": "https://other-api.example.com",
+        }
+        assert extract_api_name(headers) == "weather-alerts"
 
     def test_falls_back_to_url_prefix(self):
         headers = {"x-target-url": "https://flights-api.example.com/api"}

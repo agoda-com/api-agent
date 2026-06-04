@@ -7,12 +7,45 @@ from urllib.parse import urlencode, urljoin
 
 import httpx
 
-from ..utils.http_errors import build_http_error_response
-
 logger = logging.getLogger(__name__)
 
 # Unsafe HTTP methods (blocked by default)
 _UNSAFE_METHODS = {"POST", "PUT", "DELETE", "PATCH"}
+
+
+def _extract_http_error_details(response: httpx.Response | None) -> Any | None:
+    """Extract bounded error detail from non-2xx responses."""
+    if response is None:
+        return None
+
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+
+    if payload is not None:
+        if isinstance(payload, dict):
+            for key in ("errors", "error", "message"):
+                if key in payload:
+                    return payload[key]
+        return payload
+
+    raw = response.content[:1500] if response.content else b""
+    text = raw.decode("utf-8", errors="replace").strip() if raw else ""
+    return text[:1000] if text else None
+
+
+def _build_http_error_response(e: httpx.HTTPStatusError) -> dict[str, Any]:
+    status_code = e.response.status_code if e.response is not None else 0
+    response: dict[str, Any] = {
+        "success": False,
+        "error": f"HTTP {status_code}",
+        "status_code": status_code,
+    }
+    details = _extract_http_error_details(e.response)
+    if details is not None:
+        response["details"] = details
+    return response
 
 
 def _is_path_allowed(path: str, patterns: list[str]) -> bool:
@@ -55,7 +88,7 @@ def _build_url(
         # Filter out None values
         filtered = {k: v for k, v in query_params.items() if v is not None}
         if filtered:
-            url = f"{url}?{urlencode(filtered)}"
+            url = f"{url}?{urlencode(filtered, doseq=True)}"
 
     return url
 
@@ -140,7 +173,7 @@ async def execute_request(
             return {"success": True, "data": data}
 
         except httpx.HTTPStatusError as e:
-            return build_http_error_response(e)
+            return _build_http_error_response(e)
         except Exception as e:
             logger.exception("REST API error")
             return {"success": False, "error": str(e)}

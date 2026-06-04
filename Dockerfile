@@ -15,12 +15,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Copy project files
-COPY pyproject.toml uv.lock README.md ./
-COPY api_agent ./api_agent
-COPY start.sh ./
+COPY pyproject.toml uv.lock README.md api-agent.toml ./
 
-# Install Python dependencies
-RUN uv sync --frozen --no-dev
+# Install dependencies
+RUN uv sync --frozen --no-dev --no-install-project
+
+# Install OpenTelemetry instrumentation libraries
+RUN uv run --no-sync opentelemetry-bootstrap -a requirements > /tmp/otel-requirements.txt \
+    && uv pip install -r /tmp/otel-requirements.txt \
+    && rm /tmp/otel-requirements.txt
+
+COPY api_agent ./api_agent
+
+# Install project
+RUN uv pip install --no-deps .
+
+COPY start.sh ./
 
 EXPOSE 3000
 

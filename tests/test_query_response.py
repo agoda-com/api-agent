@@ -1,107 +1,109 @@
-"""Tests for query response building."""
+"""Tests for CSV response formatting."""
 
-from unittest.mock import MagicMock
+from types import SimpleNamespace
 
-import pytest
-
-from api_agent.tools.query import _build_response
+from api_agent.query_response import QueryResponse
+from api_agent.tools.query import _should_include_result, _should_return_csv
 from api_agent.utils.csv import to_csv
 
 
-@pytest.fixture
-def ctx_without_include_result():
-    """Context with include_result=False."""
-    ctx = MagicMock()
-    ctx.include_result = False
-    return ctx
+class TestQueryResponse:
+    """Tests for normalized query response envelope."""
 
+    def test_wrapped_payload_hides_result_and_calls_by_default(self):
+        response = QueryResponse.from_agent_result(
+            {
+                "ok": True,
+                "data": "done",
+                "result": [{"id": 1}],
+                "queries": ["{ users { id } }"],
+                "error": None,
+            },
+            "queries",
+        )
 
-@pytest.fixture
-def ctx_with_include_result():
-    """Context with include_result=True."""
-    ctx = MagicMock()
-    ctx.include_result = True
-    return ctx
-
-
-class TestBuildResponse:
-    """Tests for _build_response function."""
-
-    def test_direct_return_response_rest(self, ctx_without_include_result):
-        """Direct return response includes result and api_calls only."""
-        result = {
+        assert response.to_mcp_payload() == {
             "ok": True,
-            "result": {"users": [{"id": 1}]},
-            "api_calls": [{"method": "GET", "path": "/users"}],
+            "data": "done",
+            "error": None,
         }
-        response = _build_response(result, "api_calls", ctx_without_include_result)
 
-        assert response["ok"] is True
-        assert response["result"] == {"users": [{"id": 1}]}
-        assert response["api_calls"] == [{"method": "GET", "path": "/users"}]
-        # Should not have cruft fields
-        assert "direct_return" not in response
+    def test_result_can_be_included_in_payload(self):
+        response = QueryResponse.from_agent_result(
+            {"ok": True, "data": "done", "result": [{"id": 1}], "api_calls": [], "error": None},
+            "api_calls",
+        )
 
-    def test_direct_return_response_graphql(self, ctx_without_include_result):
-        """Direct return response includes result and queries only."""
-        result = {
-            "ok": True,
-            "result": {"data": {"users": []}},
-            "queries": ["query { users { id } }"],
+        assert response.to_mcp_payload(include_result=True)["result"] == [{"id": 1}]
+
+    def test_missing_result_is_not_forced_into_payload(self):
+        response = QueryResponse.from_agent_result(
+            {"ok": True, "data": "done", "api_calls": [], "error": None},
+            "api_calls",
+        )
+
+        assert "result" not in response.to_mcp_payload(include_result=True)
+
+    def test_direct_return_csv_marker(self):
+        response = QueryResponse.from_agent_result(
+            {"ok": True, "data": None, "result": [{"id": 1}], "queries": []},
+            "queries",
+        )
+
+        assert response.should_return_csv is True
+
+    def test_debug_payload_includes_calls_and_trace_id(self):
+        response = QueryResponse.from_agent_result(
+            {
+                "ok": True,
+                "data": "done",
+                "api_calls": [{"method": "GET"}],
+                "trace_id": "abc123",
+                "error": None,
+            },
+            "api_calls",
+        )
+
+        assert response.to_mcp_payload(include_debug=True)["debug"] == {
+            "api_calls": [{"method": "GET"}],
+            "trace_id": "abc123",
         }
-        response = _build_response(result, "queries", ctx_without_include_result)
 
-        assert response["ok"] is True
-        assert response["result"] == {"data": {"users": []}}
-        assert response["queries"] == ["query { users { id } }"]
-        assert "direct_return" not in response
+    def test_debug_direct_return_includes_result(self):
+        response = QueryResponse.from_agent_result(
+            {"ok": True, "data": None, "result": [{"id": 1}], "api_calls": []},
+            "api_calls",
+        )
+        req_ctx = SimpleNamespace(include_result=False, debug=True)
 
-    def test_result_included_when_present(self, ctx_without_include_result):
-        """Result is included when present, even without include_result flag."""
-        result = {
-            "ok": True,
-            "result": {"data": "value"},
-            "api_calls": [],
-        }
-        response = _build_response(result, "api_calls", ctx_without_include_result)
+        assert _should_include_result(response, req_ctx) is True
 
-        assert "result" in response
-        assert response["result"] == {"data": "value"}
+    def test_query_return_directly_returns_csv_when_rows_exist(self):
+        response = QueryResponse.from_agent_result(
+            {"ok": True, "data": "summary", "result": [{"id": 1}], "api_calls": []},
+            "api_calls",
+        )
+        req_ctx = SimpleNamespace(debug=False)
 
-    def test_result_included_when_include_result_true(self, ctx_with_include_result):
-        """Result included when include_result=True."""
-        result = {
-            "ok": True,
-            "result": None,
-            "api_calls": [],
-        }
-        response = _build_response(result, "api_calls", ctx_with_include_result)
+        assert _should_return_csv(response, req_ctx, return_directly=True) is True
 
-        assert "result" in response
+    def test_query_return_directly_still_wraps_without_rows(self):
+        response = QueryResponse.from_agent_result(
+            {"ok": True, "data": "summary", "api_calls": []},
+            "api_calls",
+        )
+        req_ctx = SimpleNamespace(debug=False)
 
-    def test_result_excluded_when_none_and_not_requested(self, ctx_without_include_result):
-        """Result excluded when None and include_result=False."""
-        result = {
-            "ok": True,
-            "api_calls": [],
-        }
-        response = _build_response(result, "api_calls", ctx_without_include_result)
+        assert _should_return_csv(response, req_ctx, return_directly=True) is False
 
-        assert "result" not in response
+    def test_query_debug_wraps_even_when_return_directly_requested(self):
+        response = QueryResponse.from_agent_result(
+            {"ok": True, "data": "summary", "result": [{"id": 1}], "api_calls": []},
+            "api_calls",
+        )
+        req_ctx = SimpleNamespace(debug=True)
 
-    def test_empty_api_calls(self, ctx_without_include_result):
-        """Empty api_calls list is preserved."""
-        result = {"ok": True, "api_calls": []}
-        response = _build_response(result, "api_calls", ctx_without_include_result)
-
-        assert response["api_calls"] == []
-
-    def test_empty_queries(self, ctx_without_include_result):
-        """Empty queries list is preserved."""
-        result = {"ok": True, "queries": []}
-        response = _build_response(result, "queries", ctx_without_include_result)
-
-        assert response["queries"] == []
+        assert _should_return_csv(response, req_ctx, return_directly=True) is False
 
 
 class TestToCsv:

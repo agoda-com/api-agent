@@ -2,13 +2,12 @@
 
 from unittest.mock import MagicMock
 
-from api_agent.recipe import (
+from api_agent.recipe.execution import build_partial_result, validate_recipe_params
+from api_agent.recipe.search import build_api_id
+from api_agent.recipe.tooling import (
     _sanitize_for_tool_name,
-    build_api_id,
-    build_partial_result,
     build_recipe_docstring,
     deduplicate_tool_name,
-    validate_recipe_params,
 )
 
 
@@ -21,7 +20,7 @@ def test_sanitize_for_tool_name_basic():
 def test_sanitize_for_tool_name_special_chars():
     """Test sanitization removes special characters."""
     assert _sanitize_for_tool_name("Get user's recent posts") == "get_users_recent_posts"
-    assert _sanitize_for_tool_name("Fetch data (v2)") == "fetch_data_v2"
+    assert _sanitize_for_tool_name("Fetch data beta") == "fetch_data_beta"
     assert _sanitize_for_tool_name("Query: users + posts") == "query_users_posts"
     assert _sanitize_for_tool_name("Get user's 'data'!") == "get_users_data"
 
@@ -55,8 +54,8 @@ def test_sanitize_for_tool_name_digit_prefix():
 def test_validate_recipe_params_success():
     """Test successful param validation."""
     params_spec = {
-        "user_id": {"type": "int", "default": 123},
-        "limit": {"type": "int", "default": 10},
+        "user_id": {"type": "int", "description": "User id"},
+        "limit": {"type": "int", "description": "Limit"},
     }
     provided = {"user_id": 456, "limit": 10}
     params, error = validate_recipe_params(params_spec, provided)
@@ -67,25 +66,13 @@ def test_validate_recipe_params_success():
 def test_validate_recipe_params_missing_required():
     """Test validation fails on missing required param."""
     params_spec = {
-        "user_id": {"type": "int"},  # No default = required
-        "limit": {"type": "int", "default": 10},
+        "user_id": {"type": "int", "description": "User id"},
+        "limit": {"type": "int", "description": "Limit"},
     }
     provided = {}
     params, error = validate_recipe_params(params_spec, provided)
     assert params is None
     assert "missing required param: user_id" in error
-
-
-def test_validate_recipe_params_with_defaults():
-    """Test params merge with defaults."""
-    params_spec = {
-        "user_id": {"type": "int", "default": 123},
-        "query": {"type": "str", "default": "test"},
-    }
-    provided = {"user_id": 123, "query": "custom"}
-    params, error = validate_recipe_params(params_spec, provided)
-    assert error == ""
-    assert params == {"user_id": 123, "query": "custom"}
 
 
 def test_validate_recipe_params_empty_spec():
@@ -100,7 +87,7 @@ def test_validate_recipe_params_empty_spec():
 def test_validate_recipe_params_extra_provided():
     """Test validation rejects extra params."""
     params_spec = {
-        "user_id": {"type": "int", "default": 123},
+        "user_id": {"type": "int", "description": "User id"},
     }
     provided = {"user_id": 456, "extra": "ignored"}
     params, error = validate_recipe_params(params_spec, provided)
@@ -108,50 +95,34 @@ def test_validate_recipe_params_extra_provided():
     assert "unexpected params: extra" in error
 
 
-# build_recipe_docstring tests
-
-
-def test_build_recipe_docstring_rest_single_step():
-    """Test docstring for single REST API call."""
+def test_build_recipe_docstring_normalizes_stored_description():
+    """Stored descriptions are exposed without generated API context."""
     docstring = build_recipe_docstring(
-        "Get user data", steps=[{"kind": "rest"}], sql_steps=[], api_type="rest"
+        "Get user data",
+        steps=[],
+        description="[api.example.com GraphQL API] Use for listing users. Returns user ids as CSV.",
     )
-    assert "Get user data" in docstring
-    assert "1 API call" in docstring
+    assert docstring == "Use for listing users. Returns user ids as CSV."
 
 
-def test_build_recipe_docstring_graphql_multiple():
-    """Test docstring for multiple GraphQL queries."""
-    docstring = build_recipe_docstring(
-        "Get users and posts",
-        steps=[{"kind": "graphql"}, {"kind": "graphql"}],
-        sql_steps=[],
-        api_type="graphql",
-    )
-    assert "Get users and posts" in docstring
-    assert "2 GraphQL queries" in docstring
-
-
-def test_build_recipe_docstring_sql_only():
-    """Test docstring for SQL-only recipe."""
-    docstring = build_recipe_docstring(
-        "Run SQL query", steps=[], sql_steps=["SELECT * FROM data"], api_type="rest"
-    )
-    assert "Run SQL query" in docstring
-    assert "1 SQL step" in docstring
-
-
-def test_build_recipe_docstring_mixed_steps():
-    """Test docstring for mixed API + SQL steps."""
+def test_build_recipe_docstring_ignores_step_counts():
+    """Step counts stay out of MCP tool descriptions."""
     docstring = build_recipe_docstring(
         "Complex workflow",
-        steps=[{"kind": "rest"}, {"kind": "rest"}],
-        sql_steps=["SELECT 1", "SELECT 2", "SELECT 3"],
+        steps=[
+            {"kind": "rest"},
+            {"kind": "rest"},
+            {"kind": "sql", "query_template": "SELECT 1"},
+            {"kind": "sql", "query_template": "SELECT 2"},
+            {"kind": "sql", "query_template": "SELECT 3"},
+        ],
         api_type="rest",
+        description="Use for complex workflows. Returns matching rows as CSV.",
     )
-    assert "Complex workflow" in docstring
-    assert "2 API calls" in docstring
-    assert "3 SQL steps" in docstring
+    assert "Use for complex workflows" in docstring
+    assert "API call" not in docstring
+    assert "SQL transform" not in docstring
+    assert "step" not in docstring.lower()
 
 
 # deduplicate_tool_name tests

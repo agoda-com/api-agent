@@ -5,9 +5,17 @@ Thank you for your interest in contributing!
 ## Development Setup
 
 1. Clone the repository
-2. Install dependencies: `uv sync --group dev`
-3. Run tests: `uv run pytest tests/ -v`
-4. Run linter: `uv run ruff check api_agent/`
+2. Install dependencies:
+   ```bash
+   uv sync --group dev
+   ```
+3. Run locally:
+   ```bash
+   OPENAI_API_KEY=your_key uv run api-agent
+   ```
+
+By default, local runs read `api-agent.toml` from the repository root. Set
+`API_AGENT_CONFIG=/path/to/api-agent.toml` to use another config file.
 
 ## Code Style
 
@@ -18,17 +26,33 @@ Thank you for your interest in contributing!
 
 ## Testing
 
-- Write unit tests for new code
-- Ensure all tests pass before submitting PR
-- Aim for >80% coverage on new code
+Run the full local check set before submitting a PR:
+
+```bash
+uv lock --check
+uv run ruff check api_agent/ tests/
+uv run ruff format --check api_agent/ tests/
+uv run ty check
+uv run pytest tests/ -q
+```
+
+Write tests for new behavior. Prefer behavior-focused tests over tests that pin
+private implementation details.
+
+## Changelog
+
+Update [CHANGELOG.md](CHANGELOG.md) for notable service changes. The changelog is
+for service history tracking; it is not tied to package publishing, GitHub
+Releases, or tag-based deployment.
 
 ## Pull Request Process
 
 1. Fork the repo and create a feature branch
 2. Make your changes with clear commit messages
 3. Update documentation if needed
-4. Ensure tests pass and linting is clean
-5. Submit PR with description of changes
+4. Update [CHANGELOG.md](CHANGELOG.md) for notable service changes
+5. Ensure tests pass and linting is clean
+6. Submit PR with a concise description of changes
 
 ## Reporting Issues
 
@@ -39,4 +63,4 @@ Thank you for your interest in contributing!
 
 ## Questions?
 
-Open a GitHub Discussion or Issue.
+Open a GitHub Issue.

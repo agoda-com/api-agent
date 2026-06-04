@@ -63,10 +63,11 @@ def _extract_schema(data: list[dict], table_name: str) -> dict[str, Any]:
             json.dump(data, f)
             temp_file = f.name
 
-        conn = duckdb.connect()
-        conn.execute(f"CREATE TABLE {table_name} AS SELECT * FROM read_json_auto('{temp_file}')")
-        schema = conn.execute(f"DESCRIBE {table_name}").fetchall()
-        conn.close()
+        with duckdb.connect() as conn:
+            conn.execute(
+                f"CREATE TABLE {table_name} AS SELECT * FROM read_json_auto('{temp_file}')"
+            )
+            schema = conn.execute(f"DESCRIBE {table_name}").fetchall()
 
         schema_str = ", ".join([f"{col[0]}: {col[1]}" for col in schema])
 
@@ -131,10 +132,22 @@ def truncate_for_context(
     }
 
 
-# Keep for backwards compatibility
-def get_table_schema_summary(data: list[dict], table_name: str) -> dict[str, Any]:
-    """Get DuckDB schema summary (deprecated, use extract_tables_from_response)."""
-    return _extract_schema(data, table_name)
+def _query_result_rows(conn: duckdb.DuckDBPyConnection, query: str) -> list[dict[str, Any]]:
+    temp_file = None
+    try:
+        conn.sql(query).create("__sql_result")
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            temp_file = f.name
+        conn.execute("COPY __sql_result TO ? (FORMAT json, ARRAY true)", [temp_file])
+        with open(temp_file) as f:
+            rows = json.load(f)
+        return rows if isinstance(rows, list) else []
+    finally:
+        if temp_file:
+            try:
+                os.unlink(temp_file)
+            except OSError:
+                pass
 
 
 def execute_sql(data: Any, query: str) -> dict[str, Any]:
@@ -149,31 +162,28 @@ def execute_sql(data: Any, query: str) -> dict[str, Any]:
     """
     temp_files = []
     try:
-        conn = duckdb.connect()
+        with duckdb.connect() as conn:
+            # Register top-level keys as tables via temp JSON files
+            if isinstance(data, dict):
+                for key, value in data.items():
+                    if isinstance(value, list) and value:
+                        # Write to temp file for DuckDB to read
+                        with tempfile.NamedTemporaryFile(
+                            mode="w", suffix=".json", delete=False
+                        ) as f:
+                            json.dump(value, f)
+                            temp_files.append(f.name)
+                        conn.execute(
+                            f"CREATE TABLE {key} AS SELECT * FROM read_json_auto('{f.name}')"
+                        )
+            elif isinstance(data, list):
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+                    json.dump(data, f)
+                    temp_files.append(f.name)
+                conn.execute(f"CREATE TABLE data AS SELECT * FROM read_json_auto('{f.name}')")
 
-        # Register top-level keys as tables via temp JSON files
-        if isinstance(data, dict):
-            for key, value in data.items():
-                if isinstance(value, list) and value:
-                    # Write to temp file for DuckDB to read
-                    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-                        json.dump(value, f)
-                        temp_files.append(f.name)
-                    conn.execute(f"CREATE TABLE {key} AS SELECT * FROM read_json_auto('{f.name}')")
-        elif isinstance(data, list):
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-                json.dump(data, f)
-                temp_files.append(f.name)
-            conn.execute(f"CREATE TABLE data AS SELECT * FROM read_json_auto('{f.name}')")
+            rows = _query_result_rows(conn, query)
 
-        # Execute query
-        result = conn.execute(query).fetchall()
-        columns = [desc[0] for desc in conn.description or []]
-
-        # Convert to list of dicts
-        rows = [dict(zip(columns, row)) for row in result]
-
-        conn.close()
         return {"success": True, "result": rows}
 
     except duckdb.Error as e:
@@ -182,7 +192,6 @@ def execute_sql(data: Any, query: str) -> dict[str, Any]:
         logger.exception("SQL execution error")
         return {"success": False, "error": str(e)}
     finally:
-        # Cleanup temp files
         for temp_file in temp_files:
             try:
                 os.unlink(temp_file)

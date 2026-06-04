@@ -1,13 +1,13 @@
 """REST agent using declarative queries (REST API + DuckDB SQL)."""
 
-import asyncio
 import json
 import logging
+from collections.abc import Callable
 from contextvars import ContextVar
 from datetime import datetime
 from typing import Any
 
-from agents import Agent, MaxTurnsExceeded, Runner, function_tool
+from agents import function_tool
 
 from ..config import settings
 from ..context import RequestContext
@@ -16,36 +16,38 @@ from ..executor import (
     extract_tables_from_response,
     truncate_for_context,
 )
-from ..recipe import (
-    RECIPE_STORE,
-    _return_directly_flag,
-    _set_return_directly,
-    _tools_to_final_output,
-    build_api_id,
-    build_partial_result,
-    build_recipe_docstring,
-    create_params_model,
-    deduplicate_tool_name,
+from ..recipe.contracts import (
+    get_recipe_description,
+    get_recipe_tool_args,
+    get_recipe_tool_name,
+    resolve_recipe_values,
+)
+from ..recipe.execution import (
+    build_rest_call_record,
+    collect_step_rows,
+    error_json,
     execute_recipe_steps,
     format_recipe_response,
-    maybe_extract_and_save_recipe,
-    render_param_refs,
-    search_recipes,
-    validate_and_prepare_recipe,
+    get_rest_step_call,
+    render_rest_call_sets,
+    store_step_rows,
     validate_recipe_params,
 )
+from ..recipe.learning import async_validate_and_prepare_recipe
+from ..recipe.search import build_api_id
+from ..recipe.state import _set_return_directly, mark_recipe_tool_used
+from ..recipe.tooling import build_recipe_docstring, create_params_model, deduplicate_tool_name
 from ..rest.client import execute_request
+from ..rest.polling import create_poll_tool
 from ..rest.schema_loader import fetch_schema_context
-from ..tracing import trace_metadata
 from .contextvar_utils import safe_append_contextvar_list, safe_get_contextvar
-from .model import get_run_config, model
-from .progress import get_turn_context, reset_progress
 from .prompts import (
     CONTEXT_SECTION,
     DECISION_GUIDANCE,
     EFFECTIVE_PATTERNS,
     OPTIONAL_PARAMS_SPEC,
     PERSISTENCE_SPEC,
+    REASONING_GUIDANCE,
     REST_SCHEMA_NOTATION,
     REST_TOOL_DESC,
     SEARCH_TOOL_DESC,
@@ -54,6 +56,7 @@ from .prompts import (
     TOOL_USAGE_RULES,
     UNCERTAINTY_SPEC,
 )
+from .runtime import AgentRuntimeConfig, AgentRuntimeState, LoadedSchema, run_agent_query
 from .schema_search import create_search_schema_tool
 
 logger = logging.getLogger(__name__)
@@ -73,58 +76,6 @@ _recipe_steps: ContextVar[list[dict[str, Any]]] = ContextVar("recipe_steps")
 _query_results: ContextVar[dict[str, Any]] = ContextVar("query_results")
 _last_result: ContextVar[list] = ContextVar("last_result")  # Mutable container: [result_value]
 _raw_schema: ContextVar[str] = ContextVar("raw_schema")  # Raw OpenAPI JSON for search
-_sql_steps: ContextVar[list[str]] = ContextVar("sql_steps")
-
-
-def _get_nested_value(data: dict | None, path: str) -> Any:
-    """Extract value from nested dict/list using dot notation.
-
-    Args:
-        data: Dictionary to extract from
-        path: Dot-separated path (e.g., "polling.completed", "trips.0.isCompleted")
-
-    Returns:
-        Value at path or None if not found
-    """
-    if not data or not path:
-        return None
-    keys = path.split(".")
-    current: Any = data
-    for key in keys:
-        if not isinstance(current, (dict, list)):
-            return None
-        if isinstance(current, list) and key.isdigit():
-            idx = int(key)
-            if 0 <= idx < len(current):
-                current = current[idx]
-            else:
-                return None
-        elif isinstance(current, dict):
-            current = current.get(key)
-        else:
-            return None
-        if current is None:
-            return None
-    return current
-
-
-def _set_nested_value(data: dict, path: str, value: Any) -> None:
-    """Set value in nested dict using dot notation, creating intermediate dicts.
-
-    Args:
-        data: Dictionary to modify
-        path: Dot-separated path (e.g., "polling.count")
-        value: Value to set
-    """
-    if not path:
-        return
-    keys = path.split(".")
-    current = data
-    for key in keys[:-1]:
-        if key not in current or not isinstance(current[key], dict):
-            current[key] = {}
-        current = current[key]
-    current[keys[-1]] = value
 
 
 def _build_system_prompt(poll_paths: tuple[str, ...] = (), recipe_context: str = "") -> str:
@@ -145,7 +96,7 @@ poll_until_done(method, path, done_field, done_value, body?, name?, delay_ms?)
   Poll async API until done_field equals done_value.
   - done_field: dot-path (e.g., "status", "data.0.complete", "trips.0.isCompleted")
   - done_value: target value as string ("true", "COMPLETED")
-  - delay_ms: ms between polls (default: {settings.DEFAULT_POLL_DELAY_MS}ms)
+  - delay_ms: ms between polls (default: {settings.DEFAULT_POLL_DELAY_MS}ms, max: {settings.MAX_POLL_DELAY_MS}ms)
   - Auto-increments polling.count if present in body
   Max {settings.MAX_POLLS} polls. Polling paths: {paths_str}
 """
@@ -184,6 +135,8 @@ IMPORTANT: These paths are ASYNC and REQUIRE polling: {paths_str}
 </workflow>
 
 {CONTEXT_SECTION.format(current_date=current_date, max_turns=settings.MAX_AGENT_TURNS)}
+
+{REASONING_GUIDANCE}
 
 {recipe_context}
 
@@ -294,6 +247,7 @@ def _create_rest_call_tool(ctx: RequestContext, base_url: str):
                         "path_params": pp,
                         "query_params": qp,
                         "body": bd,
+                        "result": stored_data,
                     },
                 )
             except LookupError:
@@ -332,147 +286,6 @@ def _create_rest_call_tool(ctx: RequestContext, base_url: str):
     return rest_call
 
 
-def _create_poll_tool(ctx: RequestContext, base_url: str):
-    """Create poll_until_done tool with bound context."""
-
-    @function_tool
-    async def poll_until_done(
-        method: str,
-        path: str,
-        done_field: str,
-        done_value: str,
-        body: str = "",
-        path_params: str = "",
-        query_params: str = "",
-        name: str = "poll_result",
-        delay_ms: int = 0,
-    ) -> str:
-        """Poll endpoint until done_field equals done_value. Auto-increments polling.count if present.
-
-        Args:
-            method: HTTP method (POST typically)
-            path: API path
-            done_field: Dot-path to check (e.g., "status", "polling.completed", "trips.0.isCompleted")
-            done_value: Value indicating done (e.g., "true", "0", "COMPLETED", "100")
-            body: JSON string request body
-            path_params: JSON string for path values
-            query_params: JSON string for query params
-            name: Table name for sql_query (default: poll_result)
-            delay_ms: Delay between polls in ms (default: 3000ms)
-
-        Returns:
-            JSON string with final response or error
-        """
-        pp = json.loads(path_params) if path_params else None
-        qp = json.loads(query_params) if query_params else None
-        try:
-            body_dict = json.loads(body) if body else {}
-        except json.JSONDecodeError as e:
-            return json.dumps(
-                {
-                    "success": False,
-                    "error": f"Invalid body JSON: {e.msg}",
-                }
-            )
-
-        # Internal defaults from config
-        max_polls = settings.MAX_POLLS
-        wait_ms = delay_ms if delay_ms > 0 else settings.DEFAULT_POLL_DELAY_MS
-        current = None  # Track last done_field value for error messages
-
-        attempt = 0
-        while attempt < max_polls:
-            attempt += 1
-
-            result = await execute_request(
-                method,
-                path,
-                pp,
-                qp,
-                body=body_dict if body_dict else None,
-                base_url=base_url,
-                headers=ctx.target_headers,
-                allow_unsafe_paths=list(ctx.allow_unsafe_paths),
-            )
-
-            # Track call
-            safe_append_contextvar_list(
-                _rest_calls,
-                {
-                    "method": method,
-                    "path": path,
-                    "path_params": path_params,
-                    "query_params": query_params,
-                    "body": json.dumps(body_dict) if body_dict else "",
-                    "name": name,
-                    "poll_attempt": attempt,
-                    "success": bool(result.get("success")),
-                },
-            )
-
-            if not result.get("success"):
-                return json.dumps(
-                    {
-                        "success": False,
-                        "error": result.get("error"),
-                        "attempt": attempt,
-                    }
-                )
-
-            data = result.get("data", {})
-
-            # Validate done_field exists on first response
-            current = _get_nested_value(data, done_field)
-            if current is None and attempt == 1:
-                keys = list(data.keys()) if isinstance(data, dict) else []
-                return json.dumps(
-                    {
-                        "success": False,
-                        "error": f"done_field '{done_field}' not found in response. Available keys: {keys}",
-                    }
-                )
-
-            # Check if done_field value matches done_value (string comparison)
-            is_done = str(current).lower() == done_value.lower()
-
-            if is_done:
-                # Store result for sql_query
-                try:
-                    results = _query_results.get()
-                    tables, _ = extract_tables_from_response(data, name)
-                    results.update(tables)
-                    stored = tables.get(name)
-                    if stored is not None:
-                        _last_result.get()[0] = stored
-                except LookupError:
-                    pass
-
-                return json.dumps(
-                    {
-                        "success": True,
-                        **truncate_for_context(data if isinstance(data, list) else [data], name),
-                        "attempts": attempt,
-                    },
-                    indent=2,
-                )
-
-            await asyncio.sleep(wait_ms / 1000)
-
-            # Auto-increment polling.count if present in body
-            if body_dict.get("polling", {}).get("count") is not None:
-                body_dict["polling"]["count"] += 1
-
-        return json.dumps(
-            {
-                "success": False,
-                "error": f"max_polls ({max_polls}) exceeded. Last {done_field} value: {current} (expected: {done_value})",
-                "attempts": attempt,
-            }
-        )
-
-    return poll_until_done
-
-
 @function_tool
 def sql_query(sql: str, return_directly: bool = False) -> str:
     """Run DuckDB SQL on stored REST API results.
@@ -507,7 +320,7 @@ def sql_query(sql: str, return_directly: bool = False) -> str:
             pass
 
         # Track successful SQL for recipe extraction
-        safe_append_contextvar_list(_sql_steps, sql)
+        safe_append_contextvar_list(_recipe_steps, {"kind": "sql", "query": sql, "result": rows})
 
         if return_directly:
             _set_return_directly()
@@ -521,6 +334,56 @@ def sql_query(sql: str, return_directly: bool = False) -> str:
     return json.dumps(result, indent=2)
 
 
+async def _execute_rest_recipe_step(
+    ctx: RequestContext,
+    base_url: str,
+    allow_unsafe_paths: list[str],
+    step: Any,
+    params: dict[str, Any],
+    results: dict[str, Any],
+    *,
+    record_call: Callable[[dict[str, Any]], None] | None = None,
+    pretty_errors: bool = False,
+) -> tuple[bool, Any, str, list[dict[str, Any]] | None]:
+    if not isinstance(step, dict) or step.get("kind") != "rest":
+        return False, None, error_json("invalid recipe step", pretty=pretty_errors), None
+
+    method, path, name = get_rest_step_call(step)
+    rendered_sets, render_error = render_rest_call_sets(step, params, results)
+    if render_error:
+        return False, None, error_json(render_error, pretty=pretty_errors), None
+
+    combined_rows: list[Any] = []
+    call_recs: list[dict[str, Any]] = []
+    for rendered in rendered_sets:
+        res = await execute_request(
+            method,
+            path,
+            rendered.path_params,
+            rendered.query_params,
+            rendered.body,
+            base_url=base_url,
+            headers=ctx.target_headers,
+            allow_unsafe_paths=allow_unsafe_paths,
+        )
+        if not res.get("success"):
+            return (
+                False,
+                None,
+                error_json(res.get("error", "request failed"), pretty=pretty_errors),
+                None,
+            )
+
+        combined_rows.extend(collect_step_rows(res.get("data", {}), step, rendered.binding))
+        call_rec = build_rest_call_record(method=method, path=path, name=name, rendered=rendered)
+        call_recs.append(call_rec)
+        if record_call:
+            record_call(call_rec)
+
+    store_step_rows(results, step, combined_rows)
+    return True, combined_rows, "", call_recs
+
+
 def _create_individual_recipe_tools(
     ctx: RequestContext,
     base_url: str,
@@ -531,100 +394,63 @@ def _create_individual_recipe_tools(
     seen_names: set[str] = set()
 
     for s in suggestions:
-        recipe = RECIPE_STORE.get_recipe(s["recipe_id"])
-        if not recipe:
+        recipe = s.get("recipe")
+        if not isinstance(recipe, dict):
             continue
 
-        tool_name = deduplicate_tool_name(s.get("tool_name", "unknown_recipe"), seen_names)
-        params_spec = recipe.get("params", {})
+        tool_name = deduplicate_tool_name(get_recipe_tool_name(recipe), seen_names)
+        params_spec = get_recipe_tool_args(recipe)
         docstring = build_recipe_docstring(
             s["question"],
-            recipe.get("steps", []),
-            recipe.get("sql_steps", []),
+            [],
             params_spec=params_spec,
+            description=get_recipe_description(recipe),
         )
 
         def make_tool(rid: str, pspec: dict[str, Any], doc: str, tname: str):
             ParamsModel = create_params_model(pspec, tname)
 
             async def dynamic_recipe_tool(
-                params: ParamsModel,
+                params: ParamsModel,  # ty: ignore[invalid-type-form]
                 return_directly: bool = True,
             ) -> str:
+                mark_recipe_tool_used(rid)
                 kwargs = params.model_dump()
                 validated_params, error = validate_recipe_params(pspec, kwargs)
                 if error:
                     return error
 
-                recipe, validated_params, error = validate_and_prepare_recipe(
+                recipe, validated_params, error = await async_validate_and_prepare_recipe(
                     rid, json.dumps(kwargs), _raw_schema
                 )
                 if error:
                     return error
+                assert recipe is not None
+                execution_params, error = resolve_recipe_values(recipe, validated_params or {})
+                if error:
+                    return error_json(error, pretty=False)
 
                 async def rest_step_executor(step_idx, step, params, results):
-                    if not isinstance(step, dict) or step.get("kind") != "rest":
-                        return (
-                            False,
-                            None,
-                            json.dumps(
-                                {"success": False, "error": "invalid recipe step"}, indent=2
-                            ),
-                            None,
-                        )
-
-                    method = str(step.get("method", "GET")).upper()
-                    path = str(step.get("path", ""))
-                    name = str(step.get("name") or "data")
-
-                    pp = render_param_refs(step.get("path_params") or {}, params)
-                    qp = render_param_refs(step.get("query_params") or {}, params)
-                    bd = render_param_refs(step.get("body") or {}, params)
-
-                    res = await execute_request(
-                        method,
-                        path,
-                        pp if isinstance(pp, dict) else None,
-                        qp if isinstance(qp, dict) else None,
-                        bd if isinstance(bd, dict) and bd else None,
-                        base_url=base_url,
-                        headers=ctx.target_headers,
-                        allow_unsafe_paths=list(ctx.allow_unsafe_paths),
+                    _ = step_idx
+                    success, data, step_error, call_recs = await _execute_rest_recipe_step(
+                        ctx,
+                        base_url,
+                        list(ctx.allow_unsafe_paths),
+                        step,
+                        params,
+                        results,
+                        record_call=lambda call_rec: safe_append_contextvar_list(
+                            _rest_calls, call_rec
+                        ),
+                        pretty_errors=True,
                     )
-                    if not res.get("success"):
-                        return (
-                            False,
-                            None,
-                            json.dumps(
-                                {"success": False, "error": res.get("error", "request failed")},
-                                indent=2,
-                            ),
-                            None,
-                        )
-
-                    data = res.get("data", {})
-                    tables, _ = extract_tables_from_response(data, name)
-                    results.update(tables)
                     _query_results.set(results)
-
-                    call_rec = {
-                        "method": method,
-                        "path": path,
-                        "path_params": json.dumps(pp) if pp else "",
-                        "query_params": json.dumps(qp) if qp else "",
-                        "body": json.dumps(bd) if bd else "",
-                        "name": name,
-                        "success": True,
-                    }
-                    safe_append_contextvar_list(_rest_calls, call_rec)
-                    return True, tables.get(name), "", call_rec
+                    return success, data, step_error, call_recs
 
                 executed_calls: list[dict[str, Any]] = []
-                if recipe is None or validated_params is None:
-                    return json.dumps({"success": False, "error": "recipe validation failed"})
-                success, last_data, executed_sql, error = await execute_recipe_steps(
+                success, _last_data, executed_sql, error = await execute_recipe_steps(
                     recipe,
-                    validated_params,
+                    execution_params or {},
                     _query_results,
                     _last_result,
                     rest_step_executor,
@@ -632,10 +458,6 @@ def _create_individual_recipe_tools(
                 )
                 if not success:
                     return error
-
-                # Track executed SQL for tracing
-                for sql in executed_sql:
-                    safe_append_contextvar_list(_sql_steps, sql)
 
                 if return_directly:
                     _set_return_directly()
@@ -660,166 +482,115 @@ def _create_individual_recipe_tools(
 search_schema = create_search_schema_tool(_raw_schema)
 
 
-async def process_rest_query(question: str, ctx: RequestContext) -> dict[str, Any]:
-    """Process natural language query against REST API.
-
-    Args:
-        question: Natural language question
-        ctx: Request context with target_url (OpenAPI spec) and target_headers
-    """
-    try:
-        _log(f"QUERY {question[:80]}")
-
-        # Reset per-request storage
-        _rest_calls.set([])
-        _recipe_steps.set([])
-        _sql_steps.set([])
-        _query_results.set({})
-        _last_result.set([None])  # Mutable list: [result_value]
-        _return_directly_flag.set([])  # Reset direct return flag
-        reset_progress()  # Reset turn counter
-
-        # Fetch schema context (target_url = OpenAPI spec URL)
-        schema_ctx, spec_base_url, raw_spec_json = await fetch_schema_context(
-            ctx.target_url, ctx.target_headers
-        )
-
-        # Store raw OpenAPI spec for search_schema tool
-        _raw_schema.set(raw_spec_json)
-
-        # Use header override or spec-derived base URL
-        base_url = ctx.base_url or spec_base_url
-        if not base_url:
-            return {
+async def _load_rest_schema(ctx: RequestContext) -> LoadedSchema:
+    schema_ctx, spec_base_url, raw_spec_json = await fetch_schema_context(
+        ctx.target_url, ctx.target_headers
+    )
+    base_url = ctx.base_url or spec_base_url
+    if not base_url:
+        return LoadedSchema(
+            schema_context=schema_ctx,
+            raw_schema=raw_spec_json,
+            early_response={
                 "ok": False,
                 "data": None,
                 "api_calls": [],
                 "error": "Could not determine base URL. Set X-Base-URL header or ensure spec has 'servers' field.",
-            }
+            },
+        )
+    return LoadedSchema(schema_context=schema_ctx, raw_schema=raw_spec_json, base_url=base_url)
 
-        # Pre-flight recipe search
-        suggestions, recipe_context = [], ""
-        if settings.ENABLE_RECIPES:
-            raw_schema = safe_get_contextvar(_raw_schema, "")
-            api_id = build_api_id(ctx, "rest", base_url)
-            suggestions, recipe_context = search_recipes(api_id, raw_schema, question)
-            if suggestions:
-                _log(
-                    f"PRE-FLIGHT found={len(suggestions)} ids={[s['recipe_id'] for s in suggestions]}"
-                )
-            elif raw_schema:
-                _log(f"PRE-FLIGHT no matches for api_id={api_id[:50]}")
 
-        # Create tools with bound context
-        rest_tool = _create_rest_call_tool(ctx, base_url)
-
-        # Only include poll tool if user specified poll_paths header
-        include_polling = bool(ctx.poll_paths)
-        tools = [rest_tool, sql_query, search_schema]
-        if include_polling:
-            poll_tool = _create_poll_tool(ctx, base_url)
-            tools.insert(1, poll_tool)
-        if suggestions:  # Create individual recipe tools for each suggestion
-            recipe_tools = _create_individual_recipe_tools(ctx, base_url, suggestions)
-            tools = [*recipe_tools, *tools]
-
-        # Create fresh agent with dynamic tools
-        agent = Agent(
-            name="rest-agent",
-            model=model,
-            instructions=_build_system_prompt(
-                poll_paths=ctx.poll_paths, recipe_context=recipe_context
+def _build_rest_tools(ctx: RequestContext, state: AgentRuntimeState) -> list[Any]:
+    tools = [_create_rest_call_tool(ctx, state.base_url), sql_query, search_schema]
+    if ctx.poll_paths:
+        tools.insert(
+            1,
+            create_poll_tool(
+                ctx,
+                state.base_url,
+                rest_calls_var=_rest_calls,
+                query_results_var=_query_results,
+                last_result_var=_last_result,
             ),
-            tools=tools,
-            tool_use_behavior=_tools_to_final_output,
         )
+    if state.suggestions:
+        return [*_create_individual_recipe_tools(ctx, state.base_url, state.suggestions), *tools]
+    return tools
 
-        # Inject schema into query
-        augmented_query = f"{schema_ctx}\n\nQuestion: {question}" if schema_ctx else question
 
-        # Run agent with MaxTurnsExceeded handling for partial results
-        api_calls = []
-        last_data = None
-        turn_info = ""
-        try:
-            with trace_metadata({"mcp_name": settings.MCP_SLUG, "agent_type": "rest"}):
-                result = await Runner.run(
-                    agent,
-                    augmented_query,
-                    max_turns=settings.MAX_AGENT_TURNS,
-                    run_config=get_run_config(),
-                )
+async def _validate_rest_recipe_candidate(
+    ctx: RequestContext,
+    state: AgentRuntimeState,
+    recipe: dict[str, Any],
+    tool_args: dict[str, Any],
+) -> Any:
+    execution_params, error = resolve_recipe_values(recipe, tool_args)
+    if error:
+        return None
 
-            api_calls = _rest_calls.get()
-            last_data = _last_result.get()[0]
-            turn_info = get_turn_context(settings.MAX_AGENT_TURNS)
+    query_results_var: ContextVar[dict[str, Any]] = ContextVar("rest_recipe_validation_results")
+    last_result_var: ContextVar[list[Any]] = ContextVar("rest_recipe_validation_last")
+    query_results_var.set({})
+    last_result_var.set([None])
 
-        except MaxTurnsExceeded:
-            # Return partial results when turn limit exceeded
-            api_calls = _rest_calls.get()
-            last_data = _last_result.get()[0]
-            turn_info = get_turn_context(settings.MAX_AGENT_TURNS)
-            return build_partial_result(last_data, api_calls, turn_info, "api_calls")
-
-        # Check if tool requested direct return (detected by marker)
-        is_direct_return = False
-        try:
-            is_direct_return = result.final_output == "__DIRECT_RETURN__" or bool(
-                _return_directly_flag.get()
-            )
-        except LookupError:
-            pass
-
-        # Early return for error cases (no extraction needed)
-        if not result.final_output and not is_direct_return:
-            if last_data:
-                return {
-                    "ok": True,
-                    "data": f"[Partial - {turn_info}] Data retrieved but agent didn't complete.",
-                    "result": last_data,
-                    "api_calls": api_calls,
-                    "error": None,
-                }
-            return {
-                "ok": False,
-                "data": None,
-                "result": None,
-                "api_calls": api_calls,
-                "error": f"No output ({turn_info})",
-            }
-
-        # Build result for success paths
-        if is_direct_return:
-            agent_output = None
-        else:
-            agent_output = str(result.final_output)
-            _log(f"DONE calls={len(api_calls)} output={agent_output[:100]}")
-
-        # Skip polling recipes (v1)
-        skip_polling = any("poll_attempt" in c for c in safe_get_contextvar(_rest_calls, []))
-        await maybe_extract_and_save_recipe(
-            api_type="rest",
-            api_id=build_api_id(ctx, "rest", base_url),
-            question=question,
-            steps=safe_get_contextvar(_recipe_steps, []),
-            sql_steps=safe_get_contextvar(_sql_steps, []),
-            raw_schema=safe_get_contextvar(_raw_schema, ""),
-            skip_condition=skip_polling,
+    async def rest_step_executor(step_idx, step, params, results):
+        _ = step_idx
+        success, data, step_error, call_recs = await _execute_rest_recipe_step(
+            ctx,
+            state.base_url,
+            [],
+            step,
+            params,
+            results,
         )
+        query_results_var.set(results)
+        return success, data, step_error, call_recs
 
-        return {
-            "ok": True,
-            "data": agent_output,
-            "result": last_data,
-            "api_calls": api_calls,
-            "error": None,
-        }
+    success, last_data, _executed_sql, _error = await execute_recipe_steps(
+        recipe,
+        execution_params or {},
+        query_results_var,
+        last_result_var,
+        rest_step_executor,
+        [],
+    )
+    return last_data if success else None
 
-    except Exception as e:
-        logger.exception("REST Agent error")
-        return {
-            "ok": False,
-            "data": None,
-            "api_calls": [],
-            "error": str(e),
-        }
+
+def _build_rest_prompt(ctx: RequestContext, state: AgentRuntimeState) -> str:
+    return _build_system_prompt(poll_paths=ctx.poll_paths, recipe_context=state.recipe_context)
+
+
+def _rest_api_id(ctx: RequestContext, state: AgentRuntimeState) -> str:
+    return build_api_id(ctx, "rest", state.base_url)
+
+
+def _skip_polling_recipe(_ctx: RequestContext, _state: AgentRuntimeState) -> bool:
+    return any("poll_attempt" in c for c in safe_get_contextvar(_rest_calls, []))
+
+
+_REST_RUNTIME = AgentRuntimeConfig(
+    agent_name="rest-agent",
+    agent_type="rest",
+    call_key="api_calls",
+    calls_var=_rest_calls,
+    recipe_steps_var=_recipe_steps,
+    query_results_var=_query_results,
+    last_result_var=_last_result,
+    raw_schema_var=_raw_schema,
+    load_schema=_load_rest_schema,
+    build_tools=_build_rest_tools,
+    build_prompt=_build_rest_prompt,
+    build_api_id=_rest_api_id,
+    log=_log,
+    done_log_label="calls",
+    exception_message="REST Agent error",
+    skip_recipe=_skip_polling_recipe,
+    validate_recipe_candidate=_validate_rest_recipe_candidate,
+)
+
+
+async def process_rest_query(question: str, ctx: RequestContext) -> dict[str, Any]:
+    """Process natural language query against REST API."""
+    return await run_agent_query(question, ctx, _REST_RUNTIME)

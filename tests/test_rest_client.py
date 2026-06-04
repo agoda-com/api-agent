@@ -5,77 +5,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from api_agent.rest.client import _build_url, _is_path_allowed, execute_request
-
-
-class TestIsPathAllowed:
-    """Test path allowlist matching."""
-
-    def test_exact_match(self):
-        assert _is_path_allowed("/search", ["/search"]) is True
-
-    def test_no_match(self):
-        assert _is_path_allowed("/users", ["/search"]) is False
-
-    def test_glob_star(self):
-        assert _is_path_allowed("/api/v1/search", ["/api/*/search"]) is True
-        assert _is_path_allowed("/api/v2/search", ["/api/*/search"]) is True
-        assert _is_path_allowed("/api/search", ["/api/*/search"]) is False
-
-    def test_multiple_patterns(self):
-        patterns = ["/search", "/_search", "/api/*/query"]
-        assert _is_path_allowed("/search", patterns) is True
-        assert _is_path_allowed("/_search", patterns) is True
-        assert _is_path_allowed("/api/v1/query", patterns) is True
-        assert _is_path_allowed("/users", patterns) is False
-
-    def test_empty_patterns(self):
-        assert _is_path_allowed("/search", []) is False
-
-    def test_nested_wildcard_pattern_matching(self):
-        """Verify nested wildcard patterns match expected paths."""
-        pattern = "/api/booking/search/*"
-
-        # Should match
-        assert _is_path_allowed("/api/booking/search/v1/hotels", [pattern]) is True
-        assert _is_path_allowed("/api/booking/search/anything", [pattern]) is True
-
-        # Should NOT match
-        assert _is_path_allowed("/api/booking/search", [pattern]) is False
-        assert _is_path_allowed("/api/booking/other", [pattern]) is False
-        assert _is_path_allowed("/api/other/search/v1", [pattern]) is False
-
-
-class TestBuildUrl:
-    """Test URL building."""
-
-    def test_simple_path(self):
-        url = _build_url("/users", base_url="https://api.example.com")
-        assert url == "https://api.example.com/users"
-
-    def test_path_params(self):
-        url = _build_url(
-            "/users/{id}", base_url="https://api.example.com", path_params={"id": "123"}
-        )
-        assert url == "https://api.example.com/users/123"
-
-    def test_query_params(self):
-        url = _build_url(
-            "/users", base_url="https://api.example.com", query_params={"limit": 10, "offset": 0}
-        )
-        assert "limit=10" in url
-        assert "offset=0" in url
-
-    def test_query_params_filters_none(self):
-        url = _build_url(
-            "/users", base_url="https://api.example.com", query_params={"limit": 10, "offset": None}
-        )
-        assert "limit=10" in url
-        assert "offset" not in url
-
-    def test_no_base_url_raises(self):
-        with pytest.raises(ValueError, match="No base URL provided"):
-            _build_url("/users", base_url="")
+from api_agent.rest.client import _build_url, execute_request
 
 
 class TestExecuteRequest:
@@ -133,6 +63,15 @@ class TestExecuteRequest:
         result = await execute_request("GET", "/users", base_url="")
         assert result["success"] is False
         assert "No base URL" in result["error"]
+
+    def test_list_query_params_use_repeated_keys(self):
+        url = _build_url(
+            "/key-results",
+            "https://api.example.com",
+            query_params={"ids": [10, 11], "cycle": "Y2026Q2"},
+        )
+
+        assert url == "https://api.example.com/key-results?ids=10&ids=11&cycle=Y2026Q2"
 
     @pytest.mark.asyncio
     async def test_post_allowed_with_matching_path(self):

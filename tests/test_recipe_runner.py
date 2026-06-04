@@ -1,10 +1,32 @@
 import pytest
 
 from api_agent.context import RequestContext
-from api_agent.recipe import build_api_id
 from api_agent.recipe.runner import execute_recipe_tool
-from api_agent.recipe.store import sha256_hex
+from api_agent.recipe.search import build_api_id
+from api_agent.store import sha256_hex
 from api_agent.utils.csv import to_csv
+
+
+def _contract_recipe() -> dict:
+    return {
+        "public_contract": {
+            "tool_name": "get_users",
+            "description": "Use for listing users. Returns user ids as CSV. No required params. Do not use for different user fields, joins, or workflows.",
+            "tool_args": {},
+        },
+        "execution_plan": {
+            "steps": [
+                {
+                    "id": "users",
+                    "kind": "graphql",
+                    "input": {"mode": "single", "with": {}},
+                    "call": {"query_template": "{ users { id } }"},
+                    "output": {"name": "users"},
+                }
+            ],
+        },
+        "validation_fixture": {"tool_args": {}},
+    }
 
 
 @pytest.mark.asyncio
@@ -37,17 +59,20 @@ async def test_execute_recipe_tool_return_directly_graphql(monkeypatch):
         executed_items_list.append("q1")
         return True, {"ok": 1}, ["select 1"], ""
 
+    async def fake_get_recipe_meta(_recipe_id):
+        return {
+            "schema_hash": schema_hash,
+            "api_id": api_id,
+            "recipe": _contract_recipe(),
+        }
+
     monkeypatch.setattr(
         "api_agent.recipe.runner.load_schema_and_base_url", fake_load_schema_and_base_url
     )
     monkeypatch.setattr("api_agent.recipe.runner.execute_recipe_steps", fake_execute_recipe_steps)
     monkeypatch.setattr(
-        "api_agent.recipe.runner.RECIPE_STORE.get_recipe_meta",
-        lambda _recipe_id: {
-            "schema_hash": schema_hash,
-            "api_id": api_id,
-            "recipe": {"params": {}, "steps": [], "sql_steps": []},
-        },
+        "api_agent.recipe.runner.ASYNC_API_AGENT_STORE.get_recipe_meta",
+        fake_get_recipe_meta,
     )
 
     result = await execute_recipe_tool(ctx, "r_test", params=None, return_directly=True)
@@ -84,17 +109,20 @@ async def test_execute_recipe_tool_return_directly_rest(monkeypatch):
         executed_items_list.append({"method": "GET", "path": "/users/1"})
         return True, {"id": 1}, [], ""
 
+    async def fake_get_recipe_meta(_recipe_id):
+        return {
+            "schema_hash": schema_hash,
+            "api_id": api_id,
+            "recipe": _contract_recipe(),
+        }
+
     monkeypatch.setattr(
         "api_agent.recipe.runner.load_schema_and_base_url", fake_load_schema_and_base_url
     )
     monkeypatch.setattr("api_agent.recipe.runner.execute_recipe_steps", fake_execute_recipe_steps)
     monkeypatch.setattr(
-        "api_agent.recipe.runner.RECIPE_STORE.get_recipe_meta",
-        lambda _recipe_id: {
-            "schema_hash": schema_hash,
-            "api_id": api_id,
-            "recipe": {"params": {}, "steps": [], "sql_steps": []},
-        },
+        "api_agent.recipe.runner.ASYNC_API_AGENT_STORE.get_recipe_meta",
+        fake_get_recipe_meta,
     )
 
     result = await execute_recipe_tool(ctx, "r_test", params=None, return_directly=True)

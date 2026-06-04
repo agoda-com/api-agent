@@ -7,6 +7,14 @@ Max tool calls: {max_turns}
 Use today's date to calculate relative dates (tomorrow, next week, etc.)
 </context>"""
 
+# Reasoning guidance for GPT-5.x low-effort runs
+REASONING_GUIDANCE = """<reasoning-guidance>
+- Before tool calls, internally choose the smallest API/SQL plan that can answer the request.
+- Do not expose chain-of-thought; final answers should give results, assumptions, and concise method notes only.
+- For multi-step tasks, verify each step's output shape before the next call.
+- If evidence is insufficient, say what is missing instead of guessing.
+</reasoning-guidance>"""
+
 # SQL rules (shared)
 SQL_RULES = """<sql-rules>
 - API responses TRUNCATED; full data in DuckDB table
@@ -15,6 +23,7 @@ SQL_RULES = """<sql-rules>
 - Structs: t.field.subfield (dot notation)
 - Arrays: len(arr), arr[1] (1-indexed)
 - UUIDs: CAST(id AS VARCHAR)
+- In COALESCE, CASE, UNION, and mixed-type expressions, cast IDs/dates/enums to VARCHAR
 - UNNEST: FROM t, UNNEST(t.arr) AS u(val) → t.col for original, u.val for element
 - EXCLUDE: SELECT * EXCLUDE (col) FROM t (not t.* EXCLUDE)
 - If joins/CTEs share column names, always qualify columns (e.g., table_alias.column)
@@ -43,8 +52,8 @@ OPTIONAL_PARAMS_SPEC = """<optional-params>
 # Persistence on errors
 PERSISTENCE_SPEC = """<persistence>
 - If API call fails, analyze error and retry with corrected params
-- Don't give up after first failure - adjust approach
-- Use all {max_turns} turns if needed to complete task
+- Retry only when the error suggests a concrete fix
+- Stop early when the answer is ready or the remaining path is not useful
 </persistence>"""
 
 # Effective patterns (reward good behaviors)
@@ -62,10 +71,12 @@ DECISION_GUIDANCE = """<decision-guidance>
 When to use each approach:
 
 RECIPES (if listed in <recipes> above):
+- Check available recipe tools before direct API/SQL calls
 - Score >= 0.7: Strong match, prefer recipe if params available
 - Score < 0.7: Consider direct API/SQL instead
 - Use when question very similar to past query
 - SKIP if params unclear or question differs
+- Recipe tools require all listed params; no implicit defaults at call-time
 
 DIRECT API CALLS (rest_call, graphql_query):
 - Simple data retrieval, no filtering needed

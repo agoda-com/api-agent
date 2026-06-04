@@ -1,0 +1,44 @@
+[mcp]
+name = "API Agent"
+
+[server]
+host = "0.0.0.0"
+port = 3000
+transport = "streamable-http"
+stateless_http = true
+cors_allowed_origins = "*"
+debug = false
+
+[model]
+api = "responses"
+name = "gpt-5.5"
+openai_base_url = "https://api.openai.com/v1"
+reasoning_effort = "low"
+
+[description]
+model_name = "gpt-5.4-mini"
+timeout_seconds = 15
+
+[agent]
+max_turns = 30
+max_response_chars = 50000
+max_schema_chars = 32000
+max_preview_rows = 10
+max_tool_response_chars = 32000
+
+[polling]
+max_polls = 20
+default_delay_ms = 3000
+max_delay_ms = 3000
+
+[recipes]
+enabled = true
+max_size = 1000
+learn_rate = 0.2
+
+[storage]
+backend = "memory"
+namespace = "api-agent"
+
+[redis]
+url = ""

@@ -3,6 +3,7 @@
 import json
 import logging
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import yaml
@@ -41,7 +42,7 @@ def _swagger_param_to_oas3(param: Any) -> dict[str, Any] | None:
     if param.get("in") == "body":
         return None
 
-    converted = _rewrite_refs(param)
+    converted = _rewrite_refs(dict(param))
     if "schema" in converted and isinstance(converted["schema"], dict):
         return converted
 
@@ -49,7 +50,7 @@ def _swagger_param_to_oas3(param: Any) -> dict[str, Any] | None:
     schema: dict[str, Any] = {}
     for key in ["type", "format", "items", "enum", "default", "minimum", "maximum"]:
         if key in converted:
-            schema[key] = converted[key]  # already rewritten
+            schema[key] = _rewrite_refs(converted[key])
     if schema:
         converted["schema"] = schema
     return converted
@@ -81,7 +82,7 @@ def _swagger_responses_to_oas3(responses: Any) -> dict[str, Any]:
     for code, resp in responses.items():
         if not isinstance(resp, dict):
             continue
-        converted = _rewrite_refs(resp)
+        converted = _rewrite_refs(dict(resp))
         schema = converted.pop("schema", None)
         if isinstance(schema, dict):
             converted["content"] = {"application/json": {"schema": schema}}
@@ -99,7 +100,7 @@ def _swagger_security_to_oas3(security_definitions: Any) -> dict[str, Any]:
         if not isinstance(scheme, dict):
             continue
         scheme_type = scheme.get("type", "")
-        converted = _rewrite_refs(scheme)
+        converted = _rewrite_refs(dict(scheme))
         if scheme_type == "basic":
             converted = {"type": "http", "scheme": "basic"}
         elif scheme_type == "oauth2":
@@ -152,7 +153,7 @@ def _swagger_servers_from_spec(swagger_spec: dict[str, Any]) -> list[dict[str, s
     return [{"url": f"{s}://{host}{base_path}"} for s in scheme_list]
 
 
-def normalize_swagger2_to_oas3(swagger_spec: dict[str, Any]) -> dict[str, Any]:
+def _normalize_swagger2_to_oas3(swagger_spec: dict[str, Any]) -> dict[str, Any]:
     """Normalize Swagger 2.0 spec into minimal OpenAPI 3.x structure."""
     out: dict[str, Any] = {
         "openapi": "3.0.3",
@@ -199,7 +200,7 @@ def normalize_swagger2_to_oas3(swagger_spec: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(op, dict):
                 continue
 
-            new_op = _rewrite_refs(op)
+            new_op = _rewrite_refs(dict(op))
             raw_params = op.get("parameters", [])
             if not isinstance(raw_params, list):
                 raw_params = []
@@ -260,7 +261,7 @@ async def load_openapi_spec(
             logger.warning("OpenAPI spec root is not an object")
             return {}
 
-        # Validate/normalize API schema shape
+        # Validate/normalize OpenAPI shape
         openapi_version = spec.get("openapi", "")
         if isinstance(openapi_version, str) and openapi_version.startswith("3."):
             return spec
@@ -268,7 +269,7 @@ async def load_openapi_spec(
         swagger_version = spec.get("swagger", "")
         if isinstance(swagger_version, str) and swagger_version.startswith("2."):
             logger.info("Detected Swagger 2.0 spec, normalizing to OpenAPI 3.0 shape")
-            return normalize_swagger2_to_oas3(spec)
+            return _normalize_swagger2_to_oas3(spec)
 
         logger.warning(
             f"Unsupported API schema version. openapi={openapi_version!r}, swagger={swagger_version!r}"
@@ -292,8 +293,6 @@ def get_base_url_from_spec(spec: dict[str, Any], spec_url: str = "") -> str:
 
     # Fallback: derive from spec URL (e.g., https://api.example.com/openapi.json -> https://api.example.com)
     if spec_url:
-        from urllib.parse import urlparse
-
         parsed = urlparse(spec_url)
         return f"{parsed.scheme}://{parsed.netloc}"
 
