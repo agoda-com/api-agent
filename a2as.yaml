@@ -1,0 +1,632 @@
+manifest:
+  version: "0.1.2"
+  schema: https://a2as.org/cert/schema
+  subject:
+    name: agoda-com/api-agent
+    source: https://github.com/agoda-com/api-agent
+    branch: main
+    commit: "567ecb74"
+    scope: [api_agent/agent/graphql_agent.py, api_agent/agent/model.py, api_agent/agent/progress.py, api_agent/agent/prompts.py,
+      api_agent/agent/rest_agent.py, api_agent/agent/schema_search.py, api_agent/context.py, api_agent/middleware.py]
+  issued:
+    by: A2AS.org
+    at: '2026-01-26T16:12:55Z'
+  signatures:
+    digest: sha256:jpf1ht2qOmcHCHLr9nIY1U2clbDZDomtoFaBbhNg49g
+    key: ed25519:QezZqi7Hdsc8m5IDtl-rl8-H90_HGKmzIoap00PheSk
+    sig: ed25519:RwwvfEU5V1U7AbkbiQ1dU4We55PORfol9Kt3p8kj_aRTASlelJ14Th6Vy7INgUCshS-ltYLYW6dfjbKsV6RhAg
+
+agents:
+  agent.0:
+    type: instance
+    models: [model]
+    tools: [tools]
+    params:
+      function: process_rest_query
+      name: rest-agent
+      instance: agent
+      instructions: [_build_system_prompt(poll_paths=ctx.poll_paths)]
+  agent.1:
+    type: instance
+    models: [model]
+    tools: [gql_tool, sql_query, search_schema]
+    params:
+      function: process_query
+      name: graphql-agent
+      instance: agent
+      instructions: [_build_system_prompt()]
+
+models:
+  model:
+    type: variable
+    agents: [agent.0, agent.1]
+
+tools:
+  gql_tool:
+    type: variable
+    agents: [agent.1]
+    params:
+      dynamic: "True"
+  graphql_query:
+    type: decorator
+    params:
+      description: |-
+        Execute GraphQL query and store result for sql_query.
+
+        Args:
+            query: GraphQL query string
+            name: Table name for sql_query (default: "data")
+
+        Returns:
+            JSON string with query results
+  poll_until_done:
+    type: decorator
+    params:
+      description: |-
+        Poll endpoint until done_field equals done_value. Auto-increments polling.count if present.
+
+        Args:
+            method: HTTP method (POST typically)
+            path: API path
+            done_field: Dot-path to check (e.g., "status", "polling.completed", "trips.0.isCompleted")
+            done_value: Value indicating done (e.g., "true", "0", "COMPLETED", "100")
+            body: JSON string request body
+            path_params: JSON string for path values
+            query_params: JSON string for query params
+            name: Table name for sql_query (default: poll_result)
+            delay_ms: Delay between polls in ms (default: 3000ms)
+
+        Returns:
+            JSON string with final response or error
+  rest_call:
+    type: decorator
+    params:
+      description: |-
+        Execute REST API call and store result for sql_query.
+
+        Args:
+            method: HTTP method (GET recommended, others may be blocked)
+            path: API path (e.g., /users/{id})
+            path_params: JSON string for path values (e.g., '{"id": "123"}')
+            query_params: JSON string for query params (e.g., '{"limit": 10}')
+            body: JSON string for request body (e.g., '{"name": "John"}')
+            name: Table name for sql_query (default: "data")
+
+        Returns:
+            JSON string with API response
+  search_schema:
+    type: decorator
+    agents: [agent.1]
+    params:
+      description: |-
+        Grep-like search on schema. Output: "line_num:match" or "line_num-context".
+
+        Args:
+            pattern: Regex pattern (case-insensitive)
+            context: Lines around each match (default 10)
+            before: Lines before match (overrides context)
+            after: Lines after match (overrides context)
+            offset: Number of matches to skip (for pagination)
+  sql_query:
+    type: decorator
+    agents: [agent.1]
+    params:
+      description: |-
+        Run DuckDB SQL on stored REST API results.
+
+        Tables available = names from rest_call calls + auto-extracted top-level keys.
+
+        Args:
+            sql: DuckDB SQL query
+
+        Returns:
+            JSON string with query results
+  tools:
+    type: variable
+    agents: [agent.0]
+    params:
+      dynamic: "True"
+
+imports:
+  Agent: agents.Agent
+  AliasChoices: pydantic.AliasChoices
+  Annotated: typing.Annotated
+  Any: typing.Any
+  asyncio: asyncio
+  AsyncOpenAI: openai.AsyncOpenAI
+  BaseSettings: pydantic_settings.BaseSettings
+  BatchSpanProcessor: opentelemetry.sdk.trace.export.BatchSpanProcessor
+  Callable: typing.Callable
+  CallModelData: agents.run.CallModelData
+  computed_field: pydantic.computed_field
+  CONTEXT_SECTION: prompts.CONTEXT_SECTION
+  contextmanager: contextlib.contextmanager
+  ContextVar: contextvars.ContextVar
+  CORSMiddleware: starlette.middleware.cors.CORSMiddleware
+  create_search_schema_impl: schema_search.create_search_schema_impl
+  dataclass: dataclasses.dataclass
+  datetime: datetime.datetime
+  duckdb: duckdb
+  DynamicToolNamingMiddleware: middleware.DynamicToolNamingMiddleware
+  EFFECTIVE_PATTERNS: prompts.EFFECTIVE_PATTERNS
+  execute_query: client.execute_query
+  execute_request: rest.client.execute_request
+  execute_sql: executor.execute_sql
+  extract_api_name: context.extract_api_name
+  extract_tables_from_response: executor.extract_tables_from_response
+  FastMCP: fastmcp.FastMCP
+  FastMCPTool: fastmcp.tools.tool.Tool
+  fetch_schema_context: rest.schema_loader.fetch_schema_context
+  Field: pydantic.Field
+  fnmatch: fnmatch
+  function_tool: agents.function_tool
+  Generator: typing.Generator
+  get_full_hostname: context.get_full_hostname
+  get_http_headers: fastmcp.server.dependencies.get_http_headers
+  get_request_context: context.get_request_context
+  get_run_config: model.get_run_config
+  get_turn_context: progress.get_turn_context
+  graphql_execute: graphql.execute_query
+  graphql_fetch: graphql.execute_query
+  GRAPHQL_SCHEMA_NOTATION: prompts.GRAPHQL_SCHEMA_NOTATION
+  httpx: httpx
+  increment_turn: progress.increment_turn
+  init_tracing: tracing.init_tracing
+  json: json
+  JSONResponse: starlette.responses.JSONResponse
+  logging: logging
+  MaxTurnsExceeded: agents.MaxTurnsExceeded
+  Middleware: fastmcp.server.middleware.Middleware
+  MiddlewareContext: fastmcp.server.middleware.MiddlewareContext
+  MissingHeaderError: context.MissingHeaderError
+  model: model.model
+  ModelInputData: agents.run.ModelInputData
+  ModelSettings: agents.ModelSettings
+  mt: mcp.types
+  OpenAIAgentsInstrumentor: openinference.instrumentation.openai_agents.OpenAIAgentsInstrumentor
+  OpenAIChatCompletionsModel: agents.models.openai_chatcompletions.OpenAIChatCompletionsModel
+  OPTIONAL_PARAMS_SPEC: prompts.OPTIONAL_PARAMS_SPEC
+  os: os
+  OTLPSpanExporter: opentelemetry.exporter.otlp.proto.http.trace_exporter.OTLPSpanExporter
+  PERSISTENCE_SPEC: prompts.PERSISTENCE_SPEC
+  process_query: graphql_agent.process_query
+  process_rest_query: rest_agent.process_rest_query
+  re: re
+  Reasoning: openai.types.shared.Reasoning
+  register_all_tools: tools.register_all_tools
+  register_execute_tool: execute.register_execute_tool
+  register_query_tool: query.register_query_tool
+  RequestContext: context.RequestContext
+  reset_progress: progress.reset_progress
+  Resource: opentelemetry.sdk.resources.Resource
+  REST_SCHEMA_NOTATION: prompts.REST_SCHEMA_NOTATION
+  Route: starlette.routing.Route
+  RunConfig: agents.RunConfig
+  Runner: agents.Runner
+  SEARCH_TOOL_DESC: prompts.SEARCH_TOOL_DESC
+  Sequence: collections.abc.Sequence
+  set_default_openai_api: agents.set_default_openai_api
+  set_tracing_disabled: agents.set_tracing_disabled
+  settings: config.settings
+  SettingsConfigDict: pydantic_settings.SettingsConfigDict
+  SQL_RULES: prompts.SQL_RULES
+  SQL_TOOL_DESC: prompts.SQL_TOOL_DESC
+  tempfile: tempfile
+  TextContent: mcp.types.TextContent
+  trace: opentelemetry.trace
+  trace_metadata: tracing.trace_metadata
+  TracerProvider: opentelemetry.sdk.trace.TracerProvider
+  tracing_enabled: tracing.is_enabled
+  truncate_for_context: executor.truncate_for_context
+  UNCERTAINTY_SPEC: prompts.UNCERTAINTY_SPEC
+  urlencode: urllib.parse.urlencode
+  urljoin: urllib.parse.urljoin
+  urlparse: urllib.parse.urlparse
+  using_metadata: openinference.instrumentation.using_metadata
+  uvicorn: uvicorn
+  yaml: yaml
+
+functions:
+  _build_schema_context:
+    type: sync
+    module: api_agent.agent.graphql_agent
+    args: [schema]
+    params:
+      returns: str
+  _build_system_prompt:
+    type: sync
+    module: api_agent.agent.graphql_agent
+    params:
+      returns: str
+  _build_url:
+    type: sync
+    module: api_agent.rest.client
+    args: [path, base_url, path_params, query_params]
+    params:
+      returns: str
+  _create_graphql_query_tool:
+    type: sync
+    module: api_agent.agent.graphql_agent
+    args: [ctx]
+  _create_poll_tool:
+    type: sync
+    module: api_agent.agent.rest_agent
+    args: [ctx, base_url]
+  _create_rest_call_tool:
+    type: sync
+    module: api_agent.agent.rest_agent
+    args: [ctx, base_url]
+  _extract_response_type:
+    type: sync
+    module: api_agent.rest.schema_loader
+    args: [responses]
+    params:
+      returns: str
+  _extract_schema:
+    type: sync
+    module: api_agent.executor
+    args: [data, table_name]
+    params:
+      returns: dict
+  _fetch_schema_context:
+    type: async
+    module: api_agent.agent.graphql_agent
+    args: [endpoint, headers]
+    params:
+      returns: str
+  _filter_required_args:
+    type: sync
+    module: api_agent.agent.graphql_agent
+    args: [args]
+    params:
+      returns: list[dict]
+  _format_arg:
+    type: sync
+    module: api_agent.agent.graphql_agent
+    args: [a]
+    params:
+      returns: str
+  _format_field:
+    type: sync
+    module: api_agent.agent.graphql_agent
+    args: [fld]
+    params:
+      returns: str
+  _format_params:
+    type: sync
+    module: api_agent.rest.schema_loader
+    args: [params]
+    params:
+      returns: str
+  _format_schema:
+    type: sync
+    module: api_agent.rest.schema_loader
+    args: [name, schema]
+    params:
+      returns: str
+  _format_type:
+    type: sync
+    module: api_agent.agent.graphql_agent
+    args: [t]
+    params:
+      returns: str
+  _get_nested_value:
+    type: sync
+    module: api_agent.agent.rest_agent
+    args: [data, path]
+    params:
+      returns: Any
+  _get_tool_suffix:
+    type: sync
+    module: api_agent.middleware
+    args: [internal_name]
+    params:
+      returns: str
+  _infer_string_format:
+    type: sync
+    module: api_agent.rest.schema_loader
+    args: [field_name]
+    params:
+      returns: str
+  _inject_api_context:
+    type: sync
+    module: api_agent.middleware
+    args: [description, hostname, api_type]
+    params:
+      returns: str
+  _inject_turn:
+    type: async
+    module: api_agent.agent.model
+    args: [call_data]
+    params:
+      returns: ModelInputData
+  _is_path_allowed:
+    type: sync
+    module: api_agent.rest.client
+    args: [path, patterns]
+    params:
+      returns: bool
+  _is_required:
+    type: sync
+    module: api_agent.agent.graphql_agent
+    args: [type_def]
+    params:
+      returns: bool
+  _schema_to_type:
+    type: sync
+    module: api_agent.rest.schema_loader
+    args: [schema, schemas, field_name]
+    params:
+      returns: str
+  _search_schema_impl:
+    type: sync
+    module: api_agent.agent.schema_search
+    args: [pattern, before, after, context, offset, max_chars]
+    params:
+      returns: str
+  _set_nested_value:
+    type: sync
+    module: api_agent.agent.rest_agent
+    args: [data, path, value]
+    params:
+      returns: None
+  _strip_descriptions:
+    type: sync
+    module: api_agent.agent.graphql_agent
+    args: [context]
+    params:
+      returns: str
+  _to_snake_case:
+    type: sync
+    module: api_agent.context
+    args: [name]
+    params:
+      returns: str
+  assemble:
+    type: sync
+    module: api_agent.agent.schema_search
+    args: [selected]
+    params:
+      returns: str
+  build_schema_context:
+    type: sync
+    module: api_agent.rest.schema_loader
+    args: [spec]
+    params:
+      returns: str
+  create_app:
+    type: sync
+    module: api_agent.__main__
+  create_search_schema_impl:
+    type: sync
+    module: api_agent.agent.schema_search
+    args: [raw_schema_var]
+    params:
+      returns: Callable
+  execute_graphql:
+    type: async
+    module: api_agent.executor
+    args: [query, variables]
+    params:
+      returns: dict
+  execute_query:
+    type: async
+    module: api_agent.graphql.client
+    args: [query, variables, endpoint, headers]
+    params:
+      returns: dict
+  execute_request:
+    type: async
+    module: api_agent.rest.client
+    args: [method, path, path_params, query_params, body, base_url, headers, allow_unsafe, allow_unsafe_paths]
+    params:
+      returns: dict
+  execute_sql:
+    type: sync
+    module: api_agent.executor
+    args: [data, query]
+    params:
+      returns: dict
+  extract_api_name:
+    type: sync
+    module: api_agent.context
+    args: [headers]
+    params:
+      returns: str
+  extract_tables_from_response:
+    type: sync
+    module: api_agent.executor
+    args: [data, name]
+    params:
+      returns: tuple
+  fetch_schema_context:
+    type: async
+    module: api_agent.rest.schema_loader
+    args: [spec_url, headers]
+    params:
+      returns: tuple
+  get_base_url_from_spec:
+    type: sync
+    module: api_agent.rest.schema_loader
+    args: [spec, spec_url]
+    params:
+      returns: str
+  get_full_hostname:
+    type: sync
+    module: api_agent.context
+    args: [url]
+    params:
+      returns: str
+  get_request_context:
+    type: sync
+    module: api_agent.context
+    params:
+      returns: RequestContext
+  get_run_config:
+    type: sync
+    module: api_agent.agent.model
+    params:
+      returns: RunConfig
+  get_table_schema_summary:
+    type: sync
+    module: api_agent.executor
+    args: [data, table_name]
+    params:
+      returns: dict
+  get_tool_name_prefix:
+    type: sync
+    module: api_agent.context
+    args: [url]
+    params:
+      returns: str
+  get_turn_context:
+    type: sync
+    module: api_agent.agent.progress
+    args: [max_turns]
+    params:
+      returns: str
+  graphql_query:
+    type: tool
+    module: api_agent.agent.graphql_agent
+    args: [query, name]
+    params:
+      returns: str
+  health:
+    type: async
+    module: api_agent.__main__
+    args: [request]
+  increment_turn:
+    type: sync
+    module: api_agent.agent.progress
+  init_tracing:
+    type: sync
+    module: api_agent.tracing
+    params:
+      returns: None
+  is_enabled:
+    type: sync
+    module: api_agent.tracing
+    params:
+      returns: bool
+  load_openapi_spec:
+    type: async
+    module: api_agent.rest.schema_loader
+    args: [spec_url, headers]
+    params:
+      returns: dict
+  main:
+    type: sync
+    module: api_agent.__main__
+  MCP_SLUG:
+    type: sync
+    module: api_agent.config
+    args: [self]
+    params:
+      returns: str
+  on_call_tool:
+    type: async
+    module: api_agent.middleware
+    args: [self, context, call_next]
+    params:
+      returns: mt.CallToolResult
+  on_list_tools:
+    type: async
+    module: api_agent.middleware
+    args: [self, context, call_next]
+    params:
+      returns: Sequence[FastMCPTool]
+  poll_until_done:
+    type: tool
+    module: api_agent.agent.rest_agent
+    args: [method, path, done_field, done_value, body, path_params, query_params, name, delay_ms]
+    params:
+      returns: str
+  process_query:
+    type: async
+    module: api_agent.agent.graphql_agent
+    args: [question, ctx]
+    params:
+      returns: dict
+  process_rest_query:
+    type: async
+    module: api_agent.agent.rest_agent
+    args: [question, ctx]
+    params:
+      returns: dict
+  query:
+    type: async
+    module: api_agent.tools.query
+    args: [question]
+    params:
+      returns: dict
+  register_all_tools:
+    type: sync
+    module: api_agent.tools
+    args: [mcp]
+    params:
+      returns: None
+  register_query_tool:
+    type: sync
+    module: api_agent.tools.query
+    args: [mcp]
+    params:
+      returns: None
+  reset_progress:
+    type: sync
+    module: api_agent.agent.progress
+  rest_call:
+    type: tool
+    module: api_agent.agent.rest_agent
+    args: [method, path, path_params, query_params, body, name]
+    params:
+      returns: str
+  search_schema:
+    type: tool
+    module: api_agent.agent.graphql_agent
+    args: [pattern, context, before, after, offset]
+    params:
+      returns: str
+  sql_query:
+    type: tool
+    module: api_agent.agent.graphql_agent
+    args: [sql]
+    params:
+      returns: str
+  trace_metadata:
+    type: sync
+    module: api_agent.tracing
+    args: [metadata]
+    params:
+      returns: Generator
+  truncate_for_context:
+    type: sync
+    module: api_agent.executor
+    args: [data, table_name, max_chars]
+    params:
+      returns: dict
+
+variables:
+  OTEL_EXPORTER_OTLP_ENDPOINT:
+    type: env
+    params:
+      caller: [os.getenv]
+      path: [api_agent.tracing]
+
+files:
+  .json:
+    type: literal
+    actions: [write]
+    params:
+      caller: [tempfile.NamedTemporaryFile]
+      mode: w
+      delete: "False"
+
+networks:
+  api.openai.com:
+    type: api
+    actions: [GET]
+    urls: [/v1]
+    protocols: [https]
+    ports: ["443"]
+    params:
+      links: [default]
