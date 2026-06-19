@@ -18,6 +18,7 @@ wheels/
 .vscode/
 .cursor/
 .claude/
+.codex/
 *.swp
 
 # Testing/Caching

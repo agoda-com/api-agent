@@ -1,5 +1,9 @@
 #!/bin/sh
-[ -n "${PORT:-}" ] || PORT=3000
-[ -n "${HOST:-}" ] || HOST=0.0.0.0
-export PORT HOST
-exec uv run python -m api_agent
+[ -n "${API_AGENT_CONFIG:-}" ] || API_AGENT_CONFIG=/app/api-agent.toml
+export API_AGENT_CONFIG
+
+if [ -n "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" ] || [ -n "${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-}" ]; then
+  exec uv run --no-sync opentelemetry-instrument api-agent
+fi
+
+exec uv run --no-sync api-agent

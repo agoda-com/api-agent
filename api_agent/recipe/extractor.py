@@ -3,197 +3,52 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any
 
-from agents import Agent, Runner
+from agents import Agent, AgentOutputSchema, Runner
+from agents.exceptions import ModelBehaviorError
 
-from .store import get_example_values, normalize_ws, render_param_refs, render_text_template
+from .contracts import (
+    get_recipe_description,
+    get_recipe_steps,
+    get_recipe_tool_args,
+    get_recipe_tool_name,
+    get_validation_tool_args,
+    validate_recipe_contract,
+)
+from .extractor_models import ExtractedRecipeOutput
+from .extractor_prompts import build_extractor_instructions
 
-_EXTRACTOR_INSTRUCTIONS = """You are a recipe extractor. Convert executed API calls into reusable templates.
-
-INPUT:
-- api_type: "graphql" or "rest"
-- question: user's question
-- steps: executed API calls (preserve order)
-- sql_steps: executed SQL queries (preserve order)
-- existing_recipes: list of existing recipes for this API/schema (tool_name, question, steps, sql_steps, params)
-
-OUTPUT: Single JSON object (no markdown):
-{
-  "tool_name": "<python_function_name>",
-  "params": {"paramName": {"type": "str|int|float|bool", "default": <value_from_execution>}},
-  "steps": [<same length as input>],
-  "sql_steps": [<same length as input>]
-}
-
-TOOL_NAME REQUIREMENTS:
-- snake_case Python identifier (lowercase, underscores only)
-- Max 40 characters
-- Start with a verb (get, list, fetch, find, search, etc.)
-- Descriptive but concise (e.g., "get_recent_users" not "get_all_users_who_registered_recently")
-- No special characters, only letters, numbers, underscores
-- If an existing recipe already matches this execution, reuse its tool_name.
-- Otherwise choose a tool_name not in existing_recipes.
-
-STEP FORMATS:
-- GraphQL: {"kind": "graphql", "name": "...", "query_template": "...{{param}}..."}
-- REST: {"kind": "rest", "name": "...", "method": "GET", "path": "/x", "path_params": {}, "query_params": {}, "body": {}}
-  Use {"$param": "paramName"} for parameterized values in REST objects.
-- SQL: Use {{param}} for parameterized values in sql_steps strings.
-  Example: "WHERE name ILIKE '{{startsWith}}%'" with param startsWith default "A"
-
-PARAMETERIZE these (user-specific values):
-- IDs, limits, offsets, search terms, filters, dates, LIKE/ILIKE patterns
-
-DO NOT parameterize:
-- API paths, HTTP methods, field names, table names, static config
-
-RULES:
-- Keep SAME number of steps in SAME order
-- Default values MUST match the original execution (so template renders back to original)
-- Output valid JSON only
-"""
+logger = logging.getLogger(__name__)
 
 
-def _parse_json_maybe(text: str) -> dict[str, Any] | None:
-    """Parse JSON dict, extracting from surrounding text if needed."""
-    if not text:
+def _structured_recipe(output: Any) -> dict[str, Any] | None:
+    if isinstance(output, dict):
+        try:
+            output = ExtractedRecipeOutput.model_validate(output)
+        except ValueError:
+            _reject_recipe("invalid structured extractor output")
+            return None
+
+    if not isinstance(output, ExtractedRecipeOutput):
+        _reject_recipe("invalid extractor output type")
         return None
 
-    # Try direct parse
-    try:
-        val = json.loads(text)
-        if isinstance(val, dict):
-            return val
-    except json.JSONDecodeError:
-        pass
-
-    # Try extracting JSON from text
-    start, end = text.find("{"), text.rfind("}")
-    if start != -1 and end > start:
-        try:
-            val = json.loads(text[start : end + 1])
-            if isinstance(val, dict):
-                return val
-        except json.JSONDecodeError:
-            pass
-
-    return None
+    return output.model_dump(exclude_none=True, by_alias=True)
 
 
-def _get_params_defaults(params_spec: dict[str, Any] | None) -> dict[str, Any]:
-    return get_example_values(params_spec or {}, {})
+def _reject_recipe(reason: str) -> None:
+    logger.info("Skipping recipe extraction: %s", reason)
 
 
-def _canon_obj(v: Any) -> Any:
-    """Normalize None to empty dict for comparisons."""
-    return {} if v is None else v
-
-
-_PLACEHOLDER_RE = re.compile(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}")
-
-
-def _find_used_params(recipe: dict[str, Any], api_type: str) -> set[str]:
-    """Find all {{param}} and $param references in recipe templates."""
-    used: set[str] = set()
-
-    # Check sql_steps for {{param}}
-    for sql in recipe.get("sql_steps", []):
-        if isinstance(sql, str):
-            used.update(_PLACEHOLDER_RE.findall(sql))
-
-    # Check steps
-    for step in recipe.get("steps", []):
-        if not isinstance(step, dict):
-            continue
-        # GraphQL: check query_template
-        if api_type == "graphql":
-            tmpl = step.get("query_template", "")
-            if isinstance(tmpl, str):
-                used.update(_PLACEHOLDER_RE.findall(tmpl))
-        # REST: check $param refs in path_params, query_params, body
-        else:
-            for key in ("path_params", "query_params", "body"):
-                _find_param_refs(step.get(key), used)
-
-    return used
-
-
-def _find_param_refs(obj: Any, found: set[str]) -> None:
-    """Recursively find {'$param': 'name'} refs."""
-    if isinstance(obj, dict):
-        if set(obj.keys()) == {"$param"} and isinstance(obj.get("$param"), str):
-            found.add(obj["$param"])
-        else:
-            for v in obj.values():
-                _find_param_refs(v, found)
-    elif isinstance(obj, list):
-        for v in obj:
-            _find_param_refs(v, found)
-
-
-def _validate_step_graphql(orig: dict, recipe_step: dict, params: dict) -> bool:
-    """Validate GraphQL step renders to original."""
-    if recipe_step.get("name") != orig.get("name"):
-        return False
-    tmpl = recipe_step.get("query_template")
-    if not isinstance(tmpl, str):
-        return False
-    return normalize_ws(render_text_template(tmpl, params)) == normalize_ws(
-        str(orig.get("query", ""))
-    )
-
-
-def _validate_step_rest(orig: dict, recipe_step: dict, params: dict) -> bool:
-    """Validate REST step renders to original."""
-    if recipe_step.get("name") != orig.get("name"):
-        return False
-    if str(recipe_step.get("method", "")).upper() != str(orig.get("method", "")).upper():
-        return False
-    if recipe_step.get("path") != orig.get("path"):
-        return False
-
-    for key in ("path_params", "query_params", "body"):
-        rendered = render_param_refs(_canon_obj(recipe_step.get(key)), params)
-        if rendered != _canon_obj(orig.get(key)):
-            return False
-    return True
-
-
-def _validate_equivalence(
-    *,
-    api_type: str,
-    original_steps: list[dict[str, Any]],
-    original_sql: list[str],
-    recipe: dict[str, Any],
-) -> bool:
-    """Validate recipe renders back to original execution."""
-    params_spec = recipe.get("params")
-    params = _get_params_defaults(params_spec if isinstance(params_spec, dict) else {})
-
-    r_steps = recipe.get("steps")
-    r_sql = recipe.get("sql_steps")
-    if not isinstance(r_steps, list) or not isinstance(r_sql, list):
-        return False
-    if len(r_steps) != len(original_steps) or len(r_sql) != len(original_sql):
-        return False
-
-    for orig, rec in zip(original_steps, r_steps):
-        if not isinstance(rec, dict) or rec.get("kind") != orig.get("kind"):
-            return False
-
-        validator = _validate_step_graphql if api_type == "graphql" else _validate_step_rest
-        if not validator(orig, rec, params):
-            return False
-
-    for o_sql, r_tmpl in zip(original_sql, r_sql):
-        if not isinstance(r_tmpl, str):
-            return False
-        if normalize_ws(render_text_template(r_tmpl, params)) != normalize_ws(o_sql):
-            return False
-
-    return True
+_RESERVED_TOOL_PREFIXES = ("r_", "api_", "rest_", "graphql_")
+_MAX_EXTRACTOR_TURNS = 2
+_LOWER_EQUALS_VAR_RE = re.compile(
+    r"lower\((?P<field>[^)]+)\)\s*=\s*(?:lower\()?['\"]\{\{(?P<var>[A-Za-z_][A-Za-z0-9_]*)\}\}['\"]\)?",
+    re.IGNORECASE,
+)
 
 
 async def extract_recipe(
@@ -201,8 +56,9 @@ async def extract_recipe(
     api_type: str,
     question: str,
     steps: list[dict[str, Any]],
-    sql_steps: list[str],
+    result: Any | None = None,
     existing_recipes: list[dict[str, Any]] | None = None,
+    validation_feedback: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Extract parameterized recipe from execution trace. Returns recipe or None."""
     from ..agent.model import get_run_config, model
@@ -210,65 +66,117 @@ async def extract_recipe(
     agent = Agent(
         name="recipe-extractor",
         model=model,
-        instructions=_EXTRACTOR_INSTRUCTIONS,
+        instructions=build_extractor_instructions(api_type),
         tools=[],
+        output_type=AgentOutputSchema(ExtractedRecipeOutput, strict_json_schema=False),
     )
 
     payload = {
         "api_type": api_type,
         "question": question,
         "steps": steps,
-        "sql_steps": sql_steps,
+        "result": result,
         "existing_recipes": existing_recipes or [],
     }
+    if validation_feedback:
+        payload["validation_feedback"] = validation_feedback
 
-    result = await Runner.run(
-        agent,
-        json.dumps(payload, indent=2),
-        max_turns=6,
-        run_config=get_run_config(),
-    )
-    if not result.final_output:
+    try:
+        run_result = await Runner.run(
+            agent,
+            json.dumps(payload, indent=2),
+            max_turns=_MAX_EXTRACTOR_TURNS,
+            run_config=get_run_config(),
+        )
+    except ModelBehaviorError:
+        _reject_recipe("invalid extractor output")
+        return None
+    if not run_result.final_output:
+        _reject_recipe("empty extractor output")
         return None
 
-    recipe = _parse_json_maybe(str(result.final_output))
+    recipe = _structured_recipe(run_result.final_output)
     if not recipe:
         return None
 
-    # Basic structure check
-    if "steps" not in recipe or "sql_steps" not in recipe:
-        return None
-    if not isinstance(recipe.get("params"), dict):
-        recipe["params"] = {}
-
-    # Validate tool_name: must be valid Python identifier, max 40 chars
-    tool_name = recipe.get("tool_name", "")
-    if not isinstance(tool_name, str) or not tool_name:
+    tool_name = get_recipe_tool_name(recipe)
+    if not tool_name:
+        _reject_recipe("missing tool_name")
         return None
     if not re.match(r"^[a-z][a-z0-9_]{0,39}$", tool_name):
+        _reject_recipe("invalid tool_name")
+        return None
+    if tool_name.startswith(_RESERVED_TOOL_PREFIXES):
+        _reject_recipe("invalid tool_name prefix")
         return None
 
-    # Validate declared params are actually used in templates
-    declared_params = set(recipe.get("params", {}).keys())
-    used_params = _find_used_params(recipe, api_type)
-    if declared_params and not used_params:
-        # Params declared but none used - LLM didn't parameterize templates
+    description = " ".join(get_recipe_description(recipe).split())
+    if len(description) < 40 or len(description) > 1000:
+        _reject_recipe("invalid description length")
         return None
-    if declared_params != used_params:
-        # Mismatch - prune unused params, reject if used params undeclared
-        undeclared = used_params - declared_params
-        if undeclared:
-            return None  # Template refs param not in params spec
-        # Remove unused declared params
-        recipe["params"] = {k: v for k, v in recipe["params"].items() if k in used_params}
+    if "recipe name" in description.lower():
+        _reject_recipe("invalid description text")
+        return None
+    recipe["public_contract"]["description"] = description
+    _repair_alias_sql_filters(recipe)
 
-    # Core validation: render(template, defaults) == original
-    if not _validate_equivalence(
-        api_type=api_type,
-        original_steps=steps,
-        original_sql=sql_steps,
-        recipe=recipe,
-    ):
+    if err := validate_recipe_contract(recipe, api_type):
+        _reject_recipe(err)
         return None
 
     return recipe
+
+
+def _repair_alias_sql_filters(recipe: dict[str, Any]) -> None:
+    tool_args = get_recipe_tool_args(recipe)
+    fixture_args = get_validation_tool_args(recipe)
+
+    for step in get_recipe_steps(recipe):
+        if not isinstance(step, dict) or step.get("kind") != "sql":
+            continue
+        query_template = step.get("query_template")
+        if not isinstance(query_template, str):
+            continue
+        step_input = step.get("input")
+        with_vars = step_input.get("with") if isinstance(step_input, dict) else None
+        if not isinstance(with_vars, dict):
+            continue
+
+        step["query_template"] = _LOWER_EQUALS_VAR_RE.sub(
+            lambda match: _repaired_sql_match(match, with_vars, tool_args, fixture_args),
+            query_template,
+        )
+
+
+def _repaired_sql_match(
+    match: re.Match[str],
+    with_vars: dict[str, Any],
+    tool_args: dict[str, Any],
+    fixture_args: dict[str, Any],
+) -> str:
+    var_name = match.group("var")
+    source = with_vars.get(var_name)
+    if not isinstance(source, dict):
+        return match.group(0)
+
+    arg_name = source.get("value")
+    arg_spec = tool_args.get(arg_name)
+    if not isinstance(arg_name, str) or not isinstance(arg_spec, dict):
+        return match.group(0)
+    if arg_spec.get("type") != "str":
+        return match.group(0)
+
+    transform = source.get("transform")
+    if transform is None and not _looks_like_alias(fixture_args.get(arg_name)):
+        return match.group(0)
+    if transform not in (None, "contains_pattern"):
+        return match.group(0)
+
+    source["transform"] = "contains_pattern"
+    return f"lower({match.group('field')}) LIKE lower('{{{{{var_name}}}}}')"
+
+
+def _looks_like_alias(value: Any) -> bool:
+    return isinstance(value, str) and any(
+        not char.isalnum() and not char.isspace() for char in value
+    )

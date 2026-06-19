@@ -8,11 +8,10 @@ from fastmcp import FastMCP
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
-from starlette.routing import Route
 
 from .config import settings
 from .middleware import DynamicToolNamingMiddleware
-from .tools import register_all_tools
+from .tools import register_public_tools
 
 logging.basicConfig(
     level=logging.DEBUG if settings.DEBUG else logging.INFO,
@@ -21,11 +20,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def create_app():
-    """Create MCP server application."""
-    mcp = FastMCP(settings.MCP_NAME)
-    register_all_tools(mcp)
+def create_public_mcp() -> FastMCP:
+    """Create public MCP server."""
+    mcp = FastMCP(settings.MCP_NAME, strict_input_validation=True)
+    register_public_tools(mcp)
     mcp.add_middleware(DynamicToolNamingMiddleware())
+    return mcp
+
+
+def create_app():
+    """Create ASGI application."""
+    public_mcp = create_public_mcp()
+
+    @public_mcp.custom_route("/health", methods=["GET"])
+    async def health(request):
+        return JSONResponse({"status": "ok"})
 
     cors_origins = [o.strip() for o in settings.CORS_ALLOWED_ORIGINS.split(",")]
     middleware = [
@@ -46,13 +55,12 @@ def create_app():
     ]
 
     transport = cast(Literal["http", "streamable-http", "sse"], settings.TRANSPORT)
-    app = mcp.http_app(middleware=middleware, transport=transport)
-
-    async def health(request):
-        return JSONResponse({"status": "ok"})
-
-    app.router.routes.append(Route("/health", health, methods=["GET"]))
-    return app
+    return public_mcp.http_app(
+        path="/mcp",
+        middleware=middleware,
+        stateless_http=settings.STATELESS_HTTP,
+        transport=transport,
+    )
 
 
 def main():

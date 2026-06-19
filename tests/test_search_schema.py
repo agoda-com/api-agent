@@ -2,12 +2,13 @@
 
 import json
 import re
+from contextvars import ContextVar
 
 import pytest
 
-from api_agent.agent.graphql_agent import _raw_schema
 from api_agent.agent.schema_search import create_search_schema_impl
 
+_raw_schema: ContextVar[str] = ContextVar("test_raw_schema")
 _search_schema_impl = create_search_schema_impl(_raw_schema)
 
 

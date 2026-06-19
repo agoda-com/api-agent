@@ -3,11 +3,12 @@
 import json
 import logging
 import re
+from collections.abc import Callable
 from contextvars import ContextVar
 from datetime import datetime
 from typing import Any
 
-from agents import Agent, MaxTurnsExceeded, Runner, function_tool
+from agents import function_tool
 
 from ..config import settings
 from ..context import RequestContext
@@ -17,28 +18,27 @@ from ..executor import (
     truncate_for_context,
 )
 from ..graphql import execute_query as graphql_fetch
-from ..recipe import (
-    RECIPE_STORE,
-    _return_directly_flag,
-    _set_return_directly,
-    _tools_to_final_output,
-    build_api_id,
-    build_partial_result,
-    build_recipe_docstring,
-    create_params_model,
-    deduplicate_tool_name,
+from ..graphql.schema_context import build_schema_context
+from ..recipe.contracts import (
+    get_recipe_description,
+    get_recipe_tool_args,
+    get_recipe_tool_name,
+    resolve_recipe_values,
+)
+from ..recipe.execution import (
+    collect_step_rows,
+    error_json,
     execute_recipe_steps,
     format_recipe_response,
-    maybe_extract_and_save_recipe,
-    render_text_template,
-    search_recipes,
-    validate_and_prepare_recipe,
+    render_graphql_query_sets,
+    store_step_rows,
     validate_recipe_params,
 )
-from ..tracing import trace_metadata
+from ..recipe.learning import async_validate_and_prepare_recipe
+from ..recipe.search import build_api_id
+from ..recipe.state import _set_return_directly, mark_recipe_tool_used
+from ..recipe.tooling import build_recipe_docstring, create_params_model, deduplicate_tool_name
 from .contextvar_utils import safe_append_contextvar_list, safe_get_contextvar
-from .model import get_run_config, model
-from .progress import get_turn_context, reset_progress
 from .prompts import (
     CONTEXT_SECTION,
     DECISION_GUIDANCE,
@@ -46,12 +46,14 @@ from .prompts import (
     GRAPHQL_SCHEMA_NOTATION,
     OPTIONAL_PARAMS_SPEC,
     PERSISTENCE_SPEC,
+    REASONING_GUIDANCE,
     SEARCH_TOOL_DESC,
     SQL_RULES,
     SQL_TOOL_DESC,
     TOOL_USAGE_RULES,
     UNCERTAINTY_SPEC,
 )
+from .runtime import AgentRuntimeConfig, AgentRuntimeState, LoadedSchema, run_agent_query
 from .schema_search import create_search_schema_tool
 
 logger = logging.getLogger(__name__)
@@ -71,22 +73,6 @@ _recipe_steps: ContextVar[list[dict[str, Any]]] = ContextVar("recipe_steps")
 _query_results: ContextVar[dict[str, Any]] = ContextVar("query_results")
 _last_result: ContextVar[list] = ContextVar("last_result")  # Mutable container: [result_value]
 _raw_schema: ContextVar[str] = ContextVar("raw_schema")  # Raw introspection JSON for search
-_sql_steps: ContextVar[list[str]] = ContextVar("sql_steps")
-
-
-def _format_type(t: dict | None) -> str:
-    """Convert introspection type to compact notation: [User!]!"""
-    if not t:
-        return "?"
-    kind = t.get("kind")
-    name = t.get("name")
-    inner = t.get("ofType")
-
-    if kind == "NON_NULL":
-        return f"{_format_type(inner)}!"
-    if kind == "LIST":
-        return f"[{_format_type(inner)}]"
-    return name or "?"
 
 
 _INTROSPECTION_QUERY = """{
@@ -122,97 +108,6 @@ _INTROSPECTION_QUERY_SHALLOW = """{
 }"""
 
 
-def _is_required(type_def: dict | None) -> bool:
-    """Check if GraphQL type is required (NON_NULL wrapper)."""
-    return type_def.get("kind") == "NON_NULL" if type_def else False
-
-
-def _format_arg(a: dict) -> str:
-    """Format argument with optional default value."""
-    type_str = _format_type(a["type"])
-    default = a.get("defaultValue")
-    if default is not None:
-        return f"{a['name']}: {type_str} = {default}"
-    return f"{a['name']}: {type_str}"
-
-
-def _filter_required_args(args: list[dict]) -> list[dict]:
-    """Filter to only required arguments (NON_NULL type)."""
-    return [a for a in args if _is_required(a.get("type"))]
-
-
-def _format_field(fld: dict) -> str:
-    """Format a field with optional args."""
-    args = fld.get("args", [])
-    if args:
-        arg_str = "(" + ", ".join(_format_arg(a) for a in args) + ")"
-    else:
-        arg_str = ""
-    desc = f" # {fld['description']}" if fld.get("description") else ""
-    return f"  {fld['name']}{arg_str}: {_format_type(fld['type'])}{desc}"
-
-
-def _build_schema_context(schema: dict) -> str:
-    """Build compact SDL context from introspection schema."""
-    queries = schema.get("queryType", {}).get("fields", [])
-    all_types = [t for t in schema.get("types", []) if not t["name"].startswith("__")]
-
-    objects = [
-        t
-        for t in all_types
-        if t["kind"] == "OBJECT" and t["name"] not in ("Query", "Mutation", "Subscription")
-    ]
-    enums = [t for t in all_types if t["kind"] == "ENUM"]
-    inputs = [t for t in all_types if t["kind"] == "INPUT_OBJECT"]
-    interfaces = [t for t in all_types if t["kind"] == "INTERFACE"]
-    unions = [t for t in all_types if t["kind"] == "UNION"]
-
-    lines = ["<queries>"]
-    for f in queries:
-        desc = f" # {f['description']}" if f.get("description") else ""
-        # Only show required args
-        required_args = _filter_required_args(f.get("args", []))
-        args = ", ".join(_format_arg(a) for a in required_args)
-        lines.append(f"{f['name']}({args}) -> {_format_type(f['type'])}{desc}")
-
-    if interfaces:
-        lines.append("\n<interfaces>")
-        for t in interfaces:
-            impl = [p["name"] for p in t.get("possibleTypes", []) or []]
-            impl_str = f" # implemented by: {', '.join(impl)}" if impl else ""
-            fields = [_format_field(fld) for fld in t.get("fields", []) or []]
-            lines.append(f"{t['name']} {{{impl_str}\n" + "\n".join(fields) + "\n}")
-
-    if unions:
-        lines.append("\n<unions>")
-        for t in unions:
-            types = [p["name"] for p in t.get("possibleTypes", []) or []]
-            lines.append(f"{t['name']}: {' | '.join(types)}")
-
-    lines.append("\n<types>")
-    for t in objects:
-        impl = [i["name"] for i in t.get("interfaces", []) or []]
-        impl_str = f" implements {', '.join(impl)}" if impl else ""
-        fields = [_format_field(fld) for fld in t.get("fields", []) or []]
-        lines.append(f"{t['name']}{impl_str} {{\n" + "\n".join(fields) + "\n}")
-
-    lines.append("\n<enums>")
-    for e in enums:
-        vals = " | ".join(v["name"] for v in e.get("enumValues", []))
-        lines.append(f"{e['name']}: {vals}")
-
-    lines.append("\n<inputs>")
-    for inp in inputs:
-        # Only show required input fields
-        required_fields = [
-            f for f in (inp.get("inputFields", []) or []) if _is_required(f.get("type"))
-        ]
-        fields = ", ".join(f"{f['name']}: {_format_type(f['type'])}" for f in required_fields)
-        lines.append(f"{inp['name']} {{ {fields} }}")
-
-    return "\n".join(lines)
-
-
 def _strip_descriptions(context: str) -> str:
     """Strip # comments from SDL context."""
     return re.sub(r" #[^\n]*", "", context)
@@ -246,7 +141,7 @@ async def _fetch_schema_context(endpoint: str, headers: dict[str, str] | None) -
     _raw_schema.set(json.dumps(schema, indent=2))
 
     # Build DSL for LLM context
-    context = _build_schema_context(schema)
+    context = build_schema_context(schema)
 
     if len(context) > settings.MAX_SCHEMA_CHARS:
         context = _strip_descriptions(context)
@@ -303,6 +198,8 @@ graphql_query(query, name?, return_directly?)
 </workflow>
 
 {CONTEXT_SECTION.format(current_date=current_date, max_turns=settings.MAX_AGENT_TURNS)}
+
+{REASONING_GUIDANCE}
 
 {recipe_context}
 
@@ -365,7 +262,8 @@ def _create_graphql_query_tool(ctx: RequestContext):
 
             # Track successful step for recipe extraction
             safe_append_contextvar_list(
-                _recipe_steps, {"kind": "graphql", "query": query, "name": name}
+                _recipe_steps,
+                {"kind": "graphql", "query": query, "name": name, "result": stored_data},
             )
 
         safe_append_contextvar_list(_graphql_queries, query)
@@ -390,11 +288,6 @@ def _create_graphql_query_tool(ctx: RequestContext):
                     {"success": True, **truncate_for_context(stored_data, name)},
                     indent=2,
                 )
-
-        if not result.get("success"):
-            result["hint"] = (
-                "Use search_schema to find valid field names, enum values, or required args"
-            )
 
         return json.dumps(result, indent=2)
 
@@ -438,7 +331,7 @@ def sql_query(sql: str, return_directly: bool = False) -> str:
             pass
 
         # Track successful SQL for recipe extraction
-        safe_append_contextvar_list(_sql_steps, sql)
+        safe_append_contextvar_list(_recipe_steps, {"kind": "sql", "query": sql, "result": rows})
 
         if return_directly:
             _set_return_directly()
@@ -452,6 +345,44 @@ def sql_query(sql: str, return_directly: bool = False) -> str:
     return json.dumps(result, indent=2)
 
 
+async def _execute_graphql_recipe_step(
+    ctx: RequestContext,
+    step: Any,
+    params: dict[str, Any],
+    results: dict[str, Any],
+    *,
+    record_query: Callable[[str], None] | None = None,
+    pretty_errors: bool = False,
+) -> tuple[bool, Any, str, list[str] | None]:
+    if not isinstance(step, dict) or step.get("kind") != "graphql":
+        return False, None, error_json("invalid recipe step", pretty=pretty_errors), None
+
+    rendered_queries, render_error = render_graphql_query_sets(step, params, results)
+    if render_error:
+        return False, None, error_json(render_error, pretty=pretty_errors), None
+
+    combined_rows: list[Any] = []
+    queries: list[str] = []
+    for rendered in rendered_queries:
+        query = rendered.query
+        res = await graphql_fetch(query, None, ctx.target_url, ctx.target_headers)
+        if not res.get("success"):
+            return (
+                False,
+                None,
+                error_json(res.get("error", "query failed"), pretty=pretty_errors),
+                None,
+            )
+
+        combined_rows.extend(collect_step_rows(res.get("data", {}), step, rendered.binding))
+        queries.append(query)
+        if record_query:
+            record_query(query)
+
+    store_step_rows(results, step, combined_rows)
+    return True, combined_rows, "", queries
+
+
 def _create_individual_recipe_tools(
     ctx: RequestContext,
     suggestions: list[dict[str, Any]],
@@ -461,87 +392,62 @@ def _create_individual_recipe_tools(
     seen_names: set[str] = set()
 
     for s in suggestions:
-        recipe = RECIPE_STORE.get_recipe(s["recipe_id"])
-        if not recipe:
+        recipe = s.get("recipe")
+        if not isinstance(recipe, dict):
             continue
 
-        tool_name = deduplicate_tool_name(s.get("tool_name", "unknown_recipe"), seen_names)
-        params_spec = recipe.get("params", {})
+        tool_name = deduplicate_tool_name(get_recipe_tool_name(recipe), seen_names)
+        params_spec = get_recipe_tool_args(recipe)
         docstring = build_recipe_docstring(
             s["question"],
-            recipe.get("steps", []),
-            recipe.get("sql_steps", []),
-            "graphql",
+            [],
+            api_type="graphql",
             params_spec=params_spec,
+            description=get_recipe_description(recipe),
         )
 
         def make_tool(rid: str, pspec: dict[str, Any], doc: str, tname: str):
             ParamsModel = create_params_model(pspec, tname)
 
             async def dynamic_recipe_tool(
-                params: ParamsModel,
+                params: ParamsModel,  # ty: ignore[invalid-type-form]
                 return_directly: bool = True,
             ) -> str:
+                mark_recipe_tool_used(rid)
                 kwargs = params.model_dump()
                 validated_params, error = validate_recipe_params(pspec, kwargs)
                 if error:
                     return error
 
-                recipe, validated_params, error = validate_and_prepare_recipe(
+                recipe, validated_params, error = await async_validate_and_prepare_recipe(
                     rid, json.dumps(kwargs), _raw_schema
                 )
                 if error:
                     return error
+                assert recipe is not None
+                execution_params, error = resolve_recipe_values(recipe, validated_params or {})
+                if error:
+                    return error_json(error, pretty=False)
 
                 async def graphql_step_executor(step_idx, step, params, results):
-                    if not isinstance(step, dict) or step.get("kind") != "graphql":
-                        return (
-                            False,
-                            None,
-                            json.dumps(
-                                {"success": False, "error": "invalid recipe step"}, indent=2
-                            ),
-                            None,
-                        )
-
-                    name = step.get("name") or "data"
-                    tmpl = step.get("query_template")
-                    if not isinstance(tmpl, str):
-                        return (
-                            False,
-                            None,
-                            json.dumps(
-                                {"success": False, "error": "missing query_template"}, indent=2
-                            ),
-                            None,
-                        )
-
-                    query = render_text_template(tmpl, params)
-                    res = await graphql_fetch(query, None, ctx.target_url, ctx.target_headers)
-                    if not res.get("success"):
-                        return (
-                            False,
-                            None,
-                            json.dumps(
-                                {"success": False, "error": res.get("error", "query failed")},
-                                indent=2,
-                            ),
-                            None,
-                        )
-
-                    data = res.get("data", {})
-                    tables, _ = extract_tables_from_response(data, str(name))
-                    results.update(tables)
+                    _ = step_idx
+                    success, data, step_error, queries = await _execute_graphql_recipe_step(
+                        ctx,
+                        step,
+                        params,
+                        results,
+                        record_query=lambda query: safe_append_contextvar_list(
+                            _graphql_queries, query
+                        ),
+                        pretty_errors=True,
+                    )
                     _query_results.set(results)
-                    safe_append_contextvar_list(_graphql_queries, query)
-                    return True, tables.get(str(name)), "", query
+                    return success, data, step_error, queries
 
                 executed_queries: list[str] = []
-                if recipe is None or validated_params is None:
-                    return json.dumps({"success": False, "error": "recipe validation failed"})
-                success, last_data, executed_sql, error = await execute_recipe_steps(
+                success, _last_data, executed_sql, error = await execute_recipe_steps(
                     recipe,
-                    validated_params,
+                    execution_params or {},
                     _query_results,
                     _last_result,
                     graphql_step_executor,
@@ -549,10 +455,6 @@ def _create_individual_recipe_tools(
                 )
                 if not success:
                     return error
-
-                # Track executed SQL for tracing
-                for sql in executed_sql:
-                    safe_append_contextvar_list(_sql_steps, sql)
 
                 if return_directly:
                     _set_return_directly()
@@ -573,142 +475,86 @@ def _create_individual_recipe_tools(
     return tools
 
 
+async def _load_graphql_schema(ctx: RequestContext) -> LoadedSchema:
+    schema_ctx = await _fetch_schema_context(ctx.target_url, ctx.target_headers)
+    return LoadedSchema(
+        schema_context=schema_ctx,
+        raw_schema=safe_get_contextvar(_raw_schema, ""),
+    )
+
+
+def _build_graphql_tools(ctx: RequestContext, state: AgentRuntimeState) -> list[Any]:
+    tools = [_create_graphql_query_tool(ctx), sql_query, search_schema]
+    if state.suggestions:
+        return [*_create_individual_recipe_tools(ctx, state.suggestions), *tools]
+    return tools
+
+
+async def _validate_graphql_recipe_candidate(
+    ctx: RequestContext,
+    _state: AgentRuntimeState,
+    recipe: dict[str, Any],
+    tool_args: dict[str, Any],
+) -> Any:
+    execution_params, error = resolve_recipe_values(recipe, tool_args)
+    if error:
+        return None
+
+    query_results_var: ContextVar[dict[str, Any]] = ContextVar("graphql_recipe_validation_results")
+    last_result_var: ContextVar[list[Any]] = ContextVar("graphql_recipe_validation_last")
+    query_results_var.set({})
+    last_result_var.set([None])
+
+    async def graphql_step_executor(step_idx, step, params, results):
+        _ = step_idx
+        success, data, step_error, queries = await _execute_graphql_recipe_step(
+            ctx,
+            step,
+            params,
+            results,
+        )
+        query_results_var.set(results)
+        return success, data, step_error, queries
+
+    success, last_data, _executed_sql, _error = await execute_recipe_steps(
+        recipe,
+        execution_params or {},
+        query_results_var,
+        last_result_var,
+        graphql_step_executor,
+        [],
+    )
+    return last_data if success else None
+
+
+def _build_graphql_prompt(_ctx: RequestContext, state: AgentRuntimeState) -> str:
+    return _build_system_prompt(state.recipe_context)
+
+
+def _graphql_api_id(ctx: RequestContext, _state: AgentRuntimeState) -> str:
+    return build_api_id(ctx, "graphql")
+
+
+_GRAPHQL_RUNTIME = AgentRuntimeConfig(
+    agent_name="graphql-agent",
+    agent_type="graphql",
+    call_key="queries",
+    calls_var=_graphql_queries,
+    recipe_steps_var=_recipe_steps,
+    query_results_var=_query_results,
+    last_result_var=_last_result,
+    raw_schema_var=_raw_schema,
+    load_schema=_load_graphql_schema,
+    build_tools=_build_graphql_tools,
+    build_prompt=_build_graphql_prompt,
+    build_api_id=_graphql_api_id,
+    log=_log,
+    done_log_label="queries",
+    exception_message="Agent error",
+    validate_recipe_candidate=_validate_graphql_recipe_candidate,
+)
+
+
 async def process_query(question: str, ctx: RequestContext) -> dict[str, Any]:
-    """Process natural language query against GraphQL API.
-
-    Args:
-        question: Natural language question
-        ctx: Request context with target_url and target_headers
-    """
-    try:
-        _log(f"QUERY {question[:80]}")
-
-        # Reset per-request storage
-        # Use mutable containers so tool functions can modify in-place
-        # (ContextVar.set() in child tasks doesn't propagate to parent)
-        _graphql_queries.set([])
-        _recipe_steps.set([])
-        _sql_steps.set([])
-        _query_results.set({})
-        _last_result.set([None])  # Mutable list: [result_value]
-        _return_directly_flag.set([])  # Reset direct return flag
-        reset_progress()  # Reset turn counter
-
-        # Fetch schema with dynamic endpoint
-        schema_ctx = await _fetch_schema_context(ctx.target_url, ctx.target_headers)
-
-        # Pre-flight recipe search
-        suggestions, recipe_context = [], ""
-        if settings.ENABLE_RECIPES:
-            raw_schema = safe_get_contextvar(_raw_schema, "")
-            api_id = build_api_id(ctx, "graphql")
-            suggestions, recipe_context = search_recipes(api_id, raw_schema, question)
-            if suggestions:
-                _log(
-                    f"PRE-FLIGHT found={len(suggestions)} ids={[s['recipe_id'] for s in suggestions]}"
-                )
-            elif raw_schema:
-                _log(f"PRE-FLIGHT no matches for api_id={api_id[:50]}")
-
-        # Create tools with bound context
-        gql_tool = _create_graphql_query_tool(ctx)
-        tools = [gql_tool, sql_query, search_schema]
-        if suggestions:  # Create individual recipe tools for each suggestion
-            recipe_tools = _create_individual_recipe_tools(ctx, suggestions)
-            tools = [*recipe_tools, *tools]
-
-        # Create fresh agent with dynamic tools
-        agent = Agent(
-            name="graphql-agent",
-            model=model,
-            instructions=_build_system_prompt(recipe_context),
-            tools=tools,
-            tool_use_behavior=_tools_to_final_output,
-        )
-
-        # Inject schema into query
-        augmented_query = f"{schema_ctx}\n\nQuestion: {question}" if schema_ctx else question
-
-        # Run agent with MaxTurnsExceeded handling for partial results
-        queries = []
-        last_data = None
-        turn_info = ""
-        try:
-            with trace_metadata({"mcp_name": settings.MCP_SLUG, "agent_type": "graphql"}):
-                result = await Runner.run(
-                    agent,
-                    augmented_query,
-                    max_turns=settings.MAX_AGENT_TURNS,
-                    run_config=get_run_config(),
-                )
-
-            queries = _graphql_queries.get()
-            last_data = _last_result.get()[0]
-            turn_info = get_turn_context(settings.MAX_AGENT_TURNS)
-
-        except MaxTurnsExceeded:
-            # Return partial results when turn limit exceeded
-            queries = _graphql_queries.get()
-            last_data = _last_result.get()[0]
-            turn_info = get_turn_context(settings.MAX_AGENT_TURNS)
-            return build_partial_result(last_data, queries, turn_info, "queries")
-
-        # Check if tool requested direct return (detected by marker)
-        is_direct_return = False
-        try:
-            is_direct_return = result.final_output == "__DIRECT_RETURN__" or bool(
-                _return_directly_flag.get()
-            )
-        except LookupError:
-            pass
-
-        # Early return for error cases (no extraction needed)
-        if not result.final_output and not is_direct_return:
-            if last_data:
-                return {
-                    "ok": True,
-                    "data": f"[Partial - {turn_info}] Data retrieved but agent didn't complete.",
-                    "result": last_data,
-                    "queries": queries,
-                    "error": None,
-                }
-            return {
-                "ok": False,
-                "data": None,
-                "result": None,
-                "queries": queries,
-                "error": f"No output ({turn_info})",
-            }
-
-        # Build result for success paths
-        if is_direct_return:
-            agent_output = None
-        else:
-            agent_output = str(result.final_output)
-            _log(f"DONE queries={len(queries)} output={agent_output[:100]}")
-
-        await maybe_extract_and_save_recipe(
-            api_type="graphql",
-            api_id=build_api_id(ctx, "graphql"),
-            question=question,
-            steps=safe_get_contextvar(_recipe_steps, []),
-            sql_steps=safe_get_contextvar(_sql_steps, []),
-            raw_schema=safe_get_contextvar(_raw_schema, ""),
-        )
-
-        return {
-            "ok": True,
-            "data": agent_output,
-            "result": last_data,
-            "queries": queries,
-            "error": None,
-        }
-
-    except Exception as e:
-        logger.exception("Agent error")
-        return {
-            "ok": False,
-            "data": None,
-            "queries": [],
-            "error": str(e),
-        }
+    """Process natural language query against GraphQL API."""
+    return await run_agent_query(question, ctx, _GRAPHQL_RUNTIME)
