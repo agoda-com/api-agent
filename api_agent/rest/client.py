@@ -3,7 +3,7 @@
 import fnmatch
 import logging
 from typing import Any
-from urllib.parse import urlencode, urljoin
+from urllib.parse import quote, urlencode, urljoin
 
 import httpx
 
@@ -76,7 +76,7 @@ def _build_url(
     # Substitute path params
     if path_params:
         for key, value in path_params.items():
-            path = path.replace(f"{{{key}}}", str(value))
+            path = path.replace(f"{{{key}}}", quote(str(value), safe=""))
 
     if not base_url:
         raise ValueError("No base URL provided")

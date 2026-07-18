@@ -73,6 +73,15 @@ class TestExecuteRequest:
 
         assert url == "https://api.example.com/key-results?ids=10&ids=11&cycle=Y2026Q2"
 
+    def test_path_params_are_percent_encoded(self):
+        url = _build_url(
+            "/users/{user_id}/posts",
+            "https://api.example.com/v1",
+            path_params={"user_id": "alice/bob + team"},
+        )
+
+        assert url == "https://api.example.com/v1/users/alice%2Fbob%20%2B%20team/posts"
+
     @pytest.mark.asyncio
     async def test_post_allowed_with_matching_path(self):
         # POST is allowed when path matches allow_unsafe_paths

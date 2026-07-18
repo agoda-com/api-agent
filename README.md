@@ -8,7 +8,7 @@ Point at any GraphQL or REST API. Ask questions in natural language. The agent f
 
 **🎯 Zero config.** No custom MCP code per API. Point at a GraphQL endpoint, OpenAPI 3.x spec, or Swagger 2.0 spec. The agent introspects/loads schema automatically.
 
-**✨ SQL post-processing.** API returns 10,000 unsorted rows? Agent ranks top 10. No GROUP BY? Agent aggregates. Need to join returned tables? Agent combines. The API doesn't need to support it—the agent does.
+**✨ SQL post-processing.** API returns 10,000 unsorted rows? Agent ranks top 10. No GROUP BY? Agent aggregates. Need to join returned tables? Agent combines. The API doesn't need to support it - the agent does.
 
 **🔒 Safe by default.** Read-only. Mutations blocked unless explicitly allowed.
 
@@ -102,6 +102,8 @@ That's it. Agent introspects schema, generates calls, runs SQL post-processing.
   }
 }
 ```
+
+Xquik is an independent third-party service. Not affiliated with X Corp. "Twitter" and "X" are trademarks of X Corp.
 
 **Your own API with auth:**
 ```json
@@ -325,11 +327,11 @@ flowchart TD
     A --> C["Capture successful ordered steps<br/>API and SQL interleaved"]
     C --> R["Return query response"]
     R --> L{"learn rate sample?"}
-    L -- no --> Done["Done"]
-    L -- yes --> X["Structured extractor<br/>public contract + private plan"]
+    L -->|no| Done["Done"]
+    L -->|yes| X["Structured extractor<br/>public contract + private plan"]
     X --> V{"candidate result<br/>matches original result?"}
-    V -- no --> Done
-    V -- yes --> Store["Store recipe<br/>fingerprint dedupe"]
+    V -->|no| Done
+    V -->|yes| Store["Store recipe<br/>fingerprint dedupe"]
     Store --> List["Next list_tools exposes r_{slug}"]
 
     subgraph Direct["Direct recipe call"]
@@ -377,7 +379,7 @@ Mapped REST dependency shape:
 - Recipe names use concise `snake_case` action-resource slugs. Descriptions are outcome-focused and do not inject API labels or implementation step counts.
 - If multiple recipes share the same slug, the most recently used one is exposed.
 - Tool args are **flat top-level fields** (not nested under `params`), all required, and must be user-intent inputs.
-- Clients call these tools directly — no LLM reasoning, just cached API+SQL pipeline.
+- Clients call these tools directly - no LLM reasoning, just cached API+SQL pipeline.
 
 For normal `{prefix}_query` calls, recipe reuse is still agent-mediated: matching recipes are exposed as tools and prompt hints, then the agent decides whether to call one. If the agent uses a recipe tool, that run is not learned again, and the recipe tool returns directly by default. Direct `r_{slug}` calls bypass the agent entirely and always return directly as CSV.
 
