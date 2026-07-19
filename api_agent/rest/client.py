@@ -13,6 +13,14 @@ logger = logging.getLogger(__name__)
 _UNSAFE_METHODS = {"POST", "PUT", "DELETE", "PATCH"}
 
 
+def _encode_path_param(value: Any) -> str:
+    """Encode one path parameter without leaving URL dot segments."""
+    encoded = quote(str(value), safe="")
+    if encoded in {".", ".."}:
+        return encoded.replace(".", "%2E")
+    return encoded
+
+
 def _extract_http_error_details(response: httpx.Response | None) -> Any | None:
     """Extract bounded error detail from non-2xx responses."""
     if response is None:
@@ -76,7 +84,7 @@ def _build_url(
     # Substitute path params
     if path_params:
         for key, value in path_params.items():
-            path = path.replace(f"{{{key}}}", quote(str(value), safe=""))
+            path = path.replace(f"{{{key}}}", _encode_path_param(value))
 
     if not base_url:
         raise ValueError("No base URL provided")
