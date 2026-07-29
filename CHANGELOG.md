@@ -13,6 +13,7 @@ GitHub Releases, or tag-based deployment.
 
 ### Changed
 
+- Percent-encode substituted REST path parameters.
 - Upgrade query and recipe runtime flow around shared GraphQL/REST execution.
 - Move app configuration into `api-agent.toml`.
 - Make recipe tools return CSV directly.

@@ -3,7 +3,7 @@
 import fnmatch
 import logging
 from typing import Any
-from urllib.parse import urlencode, urljoin
+from urllib.parse import quote, urlencode, urljoin
 
 import httpx
 
@@ -11,6 +11,14 @@ logger = logging.getLogger(__name__)
 
 # Unsafe HTTP methods (blocked by default)
 _UNSAFE_METHODS = {"POST", "PUT", "DELETE", "PATCH"}
+
+
+def _encode_path_param(value: Any) -> str:
+    """Encode one path parameter without leaving URL dot segments."""
+    encoded = quote(str(value), safe="")
+    if encoded in {".", ".."}:
+        return encoded.replace(".", "%2E")
+    return encoded
 
 
 def _extract_http_error_details(response: httpx.Response | None) -> Any | None:
@@ -76,7 +84,7 @@ def _build_url(
     # Substitute path params
     if path_params:
         for key, value in path_params.items():
-            path = path.replace(f"{{{key}}}", str(value))
+            path = path.replace(f"{{{key}}}", _encode_path_param(value))
 
     if not base_url:
         raise ValueError("No base URL provided")

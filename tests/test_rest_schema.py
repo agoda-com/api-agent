@@ -317,6 +317,83 @@ class TestBuildSchemaContext:
         ctx = build_schema_context(spec)
         assert "apiKey: API key in header 'X-API-Key'" in ctx
 
+    def test_xquik_openapi31_search_context(self):
+        spec = {
+            "openapi": "3.1.0",
+            "info": {"title": "Xquik API", "version": "1.0"},
+            "servers": [{"url": "https://xquik.com"}],
+            "security": [{"apiKey": []}, {"oauthBearer": []}],
+            "paths": {
+                "/api/v1/x/tweets/search": {
+                    "get": {
+                        "operationId": "searchTweets",
+                        "summary": (
+                            "Search tweets by query, Tweet ID, X status URL, or account date window"
+                        ),
+                        "parameters": [
+                            {
+                                "name": "q",
+                                "in": "query",
+                                "required": True,
+                                "schema": {"type": "string"},
+                            },
+                            {
+                                "name": "limit",
+                                "in": "query",
+                                "required": False,
+                                "schema": {"type": "integer", "default": 20, "maximum": 200},
+                            },
+                        ],
+                        "responses": {
+                            "200": {
+                                "content": {
+                                    "application/json": {
+                                        "schema": {"$ref": "#/components/schemas/PaginatedTweets"}
+                                    }
+                                }
+                            }
+                        },
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "PaginatedTweets": {
+                        "type": "object",
+                        "required": ["tweets", "has_next_page", "next_cursor"],
+                        "properties": {
+                            "tweets": {
+                                "type": "array",
+                                "items": {"$ref": "#/components/schemas/SearchTweet"},
+                            },
+                            "has_next_page": {"type": "boolean"},
+                            "next_cursor": {"type": "string"},
+                        },
+                    },
+                    "SearchTweet": {
+                        "type": "object",
+                        "required": ["id", "text"],
+                        "properties": {
+                            "id": {"type": "string"},
+                            "text": {"type": "string"},
+                            "likeCount": {"type": "integer"},
+                        },
+                    },
+                },
+                "securitySchemes": {
+                    "apiKey": {"type": "apiKey", "in": "header", "name": "x-api-key"},
+                    "oauthBearer": {"type": "http", "scheme": "bearer"},
+                },
+            },
+        }
+        ctx = build_schema_context(spec)
+        assert "GET /api/v1/x/tweets/search(q: str) -> PaginatedTweets" in ctx
+        assert "limit" not in ctx
+        assert "PaginatedTweets { tweets: SearchTweet[]!" in ctx
+        assert "SearchTweet { id: str!, text: str! }" in ctx
+        assert "apiKey: API key in header 'x-api-key'" in ctx
+        assert "oauthBearer: HTTP bearer" in ctx
+
     def test_post_endpoint_with_body(self):
         """POST endpoints show request body type."""
         spec = {

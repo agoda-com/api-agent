@@ -86,6 +86,25 @@ That's it. Agent introspects schema, generates calls, runs SQL post-processing.
 }
 ```
 
+**REST API with header auth (Xquik):**
+```json
+{
+  "mcpServers": {
+    "xquik": {
+      "url": "http://localhost:3000/mcp",
+      "headers": {
+        "X-Target-URL": "https://xquik.com/openapi.json",
+        "X-API-Type": "rest",
+        "X-API-Name": "xquik",
+        "X-Target-Headers": "{\"x-api-key\": \"YOUR_API_KEY\"}"
+      }
+    }
+  }
+}
+```
+
+Xquik is an independent third-party service. Not affiliated with X Corp. "Twitter" and "X" are trademarks of X Corp.
+
 **Your own API with auth:**
 ```json
 {
