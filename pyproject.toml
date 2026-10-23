@@ -9,6 +9,7 @@ requires-python = ">=3.11"
 dependencies = [
     "duckdb>=1.5.3",
     "fastmcp>=3.3.1,<4",
+    "graphql-core>=3.3.0",
     "httpx>=0.28.1",
     "openai-agents>=0.17.4",
     "openinference-instrumentation-openai-agents>=1.5.1",

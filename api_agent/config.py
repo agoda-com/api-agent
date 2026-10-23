@@ -20,6 +20,7 @@ _TOML_MAP: dict[str, dict[str, str]] = {
         "transport": "TRANSPORT",
         "stateless_http": "STATELESS_HTTP",
         "cors_allowed_origins": "CORS_ALLOWED_ORIGINS",
+        "allowed_target_hosts": "ALLOWED_TARGET_HOSTS",
         "debug": "DEBUG",
     },
     "model": {
@@ -153,7 +154,8 @@ class Settings(BaseSettings):
     PORT: int = 3000
     TRANSPORT: str = "streamable-http"
     STATELESS_HTTP: bool = True
-    CORS_ALLOWED_ORIGINS: str = "*"
+    CORS_ALLOWED_ORIGINS: str = ""  # comma-separated; "*" allows any browser origin
+    ALLOWED_TARGET_HOSTS: str = ""  # comma-separated host globs; empty allows any host
 
     # Recipes
     ENABLE_RECIPES: bool = True

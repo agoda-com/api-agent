@@ -159,16 +159,26 @@ def test_build_api_id_graphql():
     """Test GraphQL api_id format."""
     ctx = MagicMock()
     ctx.target_url = "https://api.example.com/graphql"
+    ctx.target_headers = {}
     api_id = build_api_id(ctx, "graphql")
-    assert api_id == "graphql:https://api.example.com/graphql"
+    assert api_id.startswith("graphql:https://api.example.com/graphql#")
 
 
 def test_build_api_id_rest():
     """Test REST api_id format includes base_url."""
     ctx = MagicMock()
     ctx.target_url = "https://api.example.com"
+    ctx.target_headers = {}
     api_id = build_api_id(ctx, "rest", base_url="/v1")
-    assert api_id == "rest:https://api.example.com|/v1"
+    assert api_id.startswith("rest:https://api.example.com|/v1#")
+
+
+def test_build_api_id_scoped_by_credentials():
+    a, b = MagicMock(), MagicMock()
+    a.target_url = b.target_url = "https://api.example.com/graphql"
+    a.target_headers = {"Authorization": "Bearer a"}
+    b.target_headers = {"Authorization": "Bearer b"}
+    assert build_api_id(a, "graphql") != build_api_id(b, "graphql")
 
 
 # build_partial_result tests

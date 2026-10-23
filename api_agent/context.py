@@ -1,5 +1,6 @@
 """Request context extraction from HTTP headers."""
 
+import fnmatch
 import json
 import logging
 import re
@@ -8,6 +9,8 @@ from typing import Literal, cast
 from urllib.parse import urlparse
 
 from fastmcp.server.dependencies import get_http_headers
+
+from .config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +86,10 @@ def parse_request_context(headers: dict[str, str]) -> RequestContext:
     if api_type not in ("graphql", "rest"):
         raise MissingHeaderError(f"X-API-Type must be 'graphql' or 'rest', got '{api_type}'")
 
+    _check_target_host(target_url)
+    if base_url_raw:
+        _check_target_host(base_url_raw)
+
     typed_api_type = cast(ApiType, api_type)
     extra = {"target_url": target_url, "api_type": api_type}
     target_headers = _parse_json_object(target_headers_raw, "target headers", extra)
@@ -108,6 +115,16 @@ def parse_request_context(headers: dict[str, str]) -> RequestContext:
         learning_rate=_parse_learning_rate(learning_rate_raw),
         debug=_is_truthy(debug_raw),
     )
+
+
+def _check_target_host(url: str) -> None:
+    # ponytail: hostname glob allowlist, no DNS/IP checks; add resolved-IP blocking if hosts are user-chosen
+    patterns = [p.strip().lower() for p in settings.ALLOWED_TARGET_HOSTS.split(",") if p.strip()]
+    if not patterns:
+        return
+    host = (urlparse(url).hostname or "").lower()
+    if not any(fnmatch.fnmatchcase(host, p) for p in patterns):
+        raise MissingHeaderError(f"Target host not allowed: {host or url}")
 
 
 def _is_truthy(value: str | None) -> bool:

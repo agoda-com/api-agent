@@ -6,7 +6,8 @@ host = "0.0.0.0"
 port = 3000
 transport = "streamable-http"
 stateless_http = true
-cors_allowed_origins = "*"
+cors_allowed_origins = ""
+allowed_target_hosts = ""
 debug = false
 
 [model]

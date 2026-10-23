@@ -33,6 +33,12 @@ def test_create_app_mounts_public_mcp_and_health_only():
     assert _route_paths(app) == {"/mcp", "/health"}
 
 
+def test_cross_origin_browser_requests_are_rejected_by_default():
+    with TestClient(create_app()) as client:
+        assert client.get("/health", headers={"origin": "http://evil.example"}).status_code == 403
+        assert client.get("/health").status_code == 200
+
+
 def test_mcp_path_does_not_redirect_to_slash_path():
     app = create_app()
 

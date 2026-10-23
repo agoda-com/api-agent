@@ -13,6 +13,8 @@ from api_agent.context import RequestContext
 from api_agent.middleware import SPECIFIC_TOOL_HINT, DynamicToolNamingMiddleware
 from api_agent.store import AsyncApiAgentStore, MemoryApiAgentStore, sha256_hex
 
+GQL_API_ID = "graphql:https://api.example.com/graphql#" + sha256_hex("{}")[:16]
+
 
 @pytest.fixture(autouse=True)
 def mock_downstream_description(monkeypatch):
@@ -108,7 +110,7 @@ class TestToolTransformation:
         schema_hash = sha256_hex(raw_schema)
         recipe = _recipe()
         store.save_recipe(
-            api_id="graphql:https://api.example.com/graphql",
+            api_id=GQL_API_ID,
             schema_hash=schema_hash,
             question="List users",
             recipe=recipe,
@@ -156,7 +158,7 @@ class TestToolTransformation:
         schema_hash = sha256_hex(raw_schema)
         recipe = _recipe()
         store.save_recipe(
-            api_id="graphql:https://api.example.com/graphql",
+            api_id=GQL_API_ID,
             schema_hash=schema_hash,
             question="List users",
             recipe=recipe,
@@ -270,7 +272,7 @@ class TestRecipeToolListing:
         monkeypatch.setattr("api_agent.middleware.settings.ENABLE_RECIPES", True)
 
         raw_schema = '{"schema":"ok"}'
-        api_id = "graphql:https://api.example.com/graphql"
+        api_id = GQL_API_ID
         schema_hash = sha256_hex(raw_schema)
         recipe = _recipe(
             tool_name="list_users_reporting_to_manager",
@@ -338,7 +340,7 @@ class TestRecipeToolListing:
         monkeypatch.setattr("api_agent.middleware.settings.ENABLE_RECIPES", True)
 
         raw_schema = '{"schema":"ok"}'
-        api_id = "graphql:https://api.example.com/graphql"
+        api_id = GQL_API_ID
         schema_hash = sha256_hex(raw_schema)
         recipe = _recipe(
             tool_name="list_users_with_extremely_long_recipe_name_that_needs_truncation_for_limits",
@@ -402,7 +404,7 @@ class TestRecipeToolSchema:
         monkeypatch.setattr("api_agent.middleware.settings.ENABLE_RECIPES", True)
 
         raw_schema = '{"schema":"ok"}'
-        api_id = "graphql:https://api.example.com/graphql"
+        api_id = GQL_API_ID
         schema_hash = sha256_hex(raw_schema)
         recipe = _recipe(
             tool_name="list_users",
@@ -471,7 +473,7 @@ class TestRecipeToolSchema:
         monkeypatch.setattr("api_agent.middleware.settings.ENABLE_RECIPES", True)
 
         raw_schema = '{"schema":"ok"}'
-        api_id = "graphql:https://api.example.com/graphql"
+        api_id = GQL_API_ID
         schema_hash = sha256_hex(raw_schema)
         recipe = _recipe(
             tool_name="list_users",
@@ -593,7 +595,7 @@ class TestRecipeToolErrors:
         )
 
         raw_schema = '{"schema":"ok"}'
-        api_id = "graphql:https://api.example.com/graphql"
+        api_id = GQL_API_ID
         schema_hash = sha256_hex(raw_schema)
         recipe = _recipe(
             tool_name="list_users",

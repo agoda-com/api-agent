@@ -2,27 +2,75 @@
 
 from __future__ import annotations
 
+import json
 import re
-from typing import Any
+from typing import Any, Literal
+
+import duckdb
+from graphql.language import Lexer, Source, TokenKind
 
 _PLACEHOLDER_RE = re.compile(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}")
+_BARE_SAFE_RE = re.compile(r"-?[A-Za-z0-9_.]+")
 
 
-def render_text_template(template: str, params: dict[str, Any]) -> str:
-    """Render {{param}} placeholders using raw string insertion."""
+def _string_spans(template: str, language: str) -> list[tuple[int, int, str]]:
+    """(start, end, delimiter) of string literals, per the GraphQL or DuckDB lexer."""
+    spans: list[tuple[int, int, str]] = []
+    if language == "graphql":
+        lexer = Lexer(Source(template))
+        token = lexer.advance()
+        while token.kind != TokenKind.EOF:
+            if token.kind in (TokenKind.STRING, TokenKind.BLOCK_STRING):
+                delim = '"""' if token.kind == TokenKind.BLOCK_STRING else '"'
+                spans.append((token.start, token.end, delim))
+            token = lexer.advance()
+        return spans
+    tokens = duckdb.tokenize(template)
+    for (start, kind), (end, _) in zip(tokens, [*tokens[1:], (len(template), None)]):
+        if kind == duckdb.token_type.string_const:
+            spans.append((start, end, "'"))
+        elif kind == duckdb.token_type.identifier and template[start] == '"':
+            spans.append((start, end, '"'))
+    return spans
 
-    def _as_text(v: Any) -> str:
-        if isinstance(v, bool):
-            return "true" if v else "false"
-        if v is None:
-            return "null"
-        return str(v)
+
+def render_text_template(
+    template: str, params: dict[str, Any], language: Literal["graphql", "sql"]
+) -> str:
+    """Render {{param}} placeholders as escaped GraphQL or SQL literals.
+
+    Inside a string literal, values are escaped; bare, strings that are not plain
+    names/numbers are emitted as quoted string literals.
+    """
+    quote = '"' if language == "graphql" else "'"
+    spans = _string_spans(template, language)
+
+    def escape(s: str, state: str = quote) -> str:
+        if state == '"""':
+            return s.replace('"""', '\\"""')
+        if state == '"':
+            return json.dumps(s)[1:-1] if language == "graphql" else s.replace('"', '""')
+        return s.replace("'", "''")
 
     def repl(m: re.Match[str]) -> str:
         name = m.group(1)
         if name not in params:
             raise KeyError(f"missing param: {name}")
-        return _as_text(params[name])
+        v = params[name]
+        if isinstance(v, bool):
+            text = "true" if v else "false"
+        elif v is None:
+            text = "null"
+        elif isinstance(v, list) and language == "graphql":
+            text = json.dumps(v)
+        else:
+            text = str(v)
+        state = next((d for s, e, d in spans if s < m.start() < e), None)
+        if state:
+            return escape(text, state)
+        if isinstance(v, str) and not _BARE_SAFE_RE.fullmatch(v):
+            return f"{quote}{escape(v)}{quote}"
+        return text
 
     return _PLACEHOLDER_RE.sub(repl, template)
 

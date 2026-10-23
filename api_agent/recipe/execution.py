@@ -7,6 +7,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
+from graphql import GraphQLError
 from pydantic import ValidationError as PydanticValidationError
 
 from ..executor import execute_sql, extract_tables_from_response, truncate_for_context
@@ -81,7 +82,7 @@ def _execute_sql_step(
     if not input_sets:
         return False, "", error_json("sql step has no input")
 
-    sql = render_text_template(sql_tmpl, input_sets[0].params)
+    sql = render_text_template(sql_tmpl, input_sets[0].params, "sql")
     res = execute_sql(results, sql)
     if not res.get("success"):
         return False, sql, json.dumps(res, indent=2)
@@ -156,8 +157,8 @@ def render_graphql_query_sets(
     rendered: list[RenderedGraphQLQuery] = []
     for input_set in input_sets:
         try:
-            query = render_text_template(tmpl, input_set.params)
-        except KeyError as e:
+            query = render_text_template(tmpl, input_set.params, "graphql")
+        except (KeyError, GraphQLError) as e:
             return [], str(e)
         rendered.append(RenderedGraphQLQuery(query=query, binding=input_set.binding))
     return rendered, ""

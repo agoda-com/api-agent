@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from ..store import ASYNC_API_AGENT_STORE, sha256_hex
@@ -15,10 +16,11 @@ from .tooling import _sanitize_for_tool_name
 
 
 def build_api_id(ctx, api_type: str, base_url: str = "") -> str:
-    """Build api_id string for recipe matching."""
+    """Build api_id string for recipe matching, scoped to the caller's credentials."""
+    scope = sha256_hex(json.dumps(ctx.target_headers, sort_keys=True))[:16]
     if api_type == "graphql":
-        return f"graphql:{ctx.target_url}"
-    return f"rest:{ctx.target_url}|{base_url}"
+        return f"graphql:{ctx.target_url}#{scope}"
+    return f"rest:{ctx.target_url}|{base_url}#{scope}"
 
 
 def _score_hint(score: float) -> str:

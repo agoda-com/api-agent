@@ -3,14 +3,23 @@
 import json
 import logging
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlsplit
 
-import httpx
 import yaml
 
 from ..config import settings
+from ..utils.http import bounded_request
 
 logger = logging.getLogger(__name__)
+
+
+class _NoAliasLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects aliases, which can expand exponentially."""
+
+    def compose_node(self, parent: Any, index: Any) -> Any:
+        if self.check_event(yaml.AliasEvent):
+            raise yaml.YAMLError("YAML aliases are not supported in API specs")
+        return super().compose_node(parent, index)
 
 
 def _rewrite_swagger_ref(ref: Any) -> Any:
@@ -246,16 +255,15 @@ async def load_openapi_spec(
     request_headers = dict(headers) if headers else {}
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.get(spec_url, headers=request_headers)
-            resp.raise_for_status()
-            raw = resp.text
+        resp = await bounded_request("GET", spec_url, headers=request_headers)
+        resp.raise_for_status()
+        raw = resp.text
 
         # Parse JSON or YAML
         if raw.strip().startswith("{"):
             spec = json.loads(raw)
         else:
-            spec = yaml.safe_load(raw)
+            spec = yaml.load(raw, Loader=_NoAliasLoader)
 
         if not isinstance(spec, dict):
             logger.warning("OpenAPI spec root is not an object")
@@ -281,22 +289,38 @@ async def load_openapi_spec(
         return {}
 
 
+def _origin(url: str) -> tuple[str, str | None, int | None]:
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    return scheme, parts.hostname, parts.port or {"http": 80, "https": 443}.get(scheme)
+
+
 def get_base_url_from_spec(spec: dict[str, Any], spec_url: str = "") -> str:
-    """Extract base URL from OpenAPI spec's servers[0], or derive from spec URL."""
+    """Extract base URL from servers[0] on the spec's origin, or derive from spec URL.
+
+    A server on another origin would receive the target auth headers, so it is
+    ignored; callers that need it must set X-Base-URL explicitly.
+    """
+    origin = ""
+    if spec_url:
+        parsed = urlsplit(spec_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+
     servers = spec.get("servers", [])
     if isinstance(servers, list) and servers:
         first = servers[0]
         if isinstance(first, dict):
             url = first.get("url", "")
-            if isinstance(url, str):
-                return url
+            if isinstance(url, str) and url:
+                resolved = urljoin(spec_url, url) if spec_url else url
+                if not spec_url or _origin(resolved) == _origin(spec_url):
+                    return resolved
+                logger.warning(
+                    "Ignoring OpenAPI server on another origin: %s; set X-Base-URL to use it",
+                    resolved,
+                )
 
-    # Fallback: derive from spec URL (e.g., https://api.example.com/openapi.json -> https://api.example.com)
-    if spec_url:
-        parsed = urlparse(spec_url)
-        return f"{parsed.scheme}://{parsed.netloc}"
-
-    return ""
+    return origin
 
 
 def _infer_string_format(field_name: str) -> str:

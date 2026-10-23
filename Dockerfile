@@ -34,6 +34,10 @@ COPY start.sh ./
 
 EXPOSE 3000
 
-RUN chmod +x ./start.sh
+RUN chmod +x ./start.sh \
+    && useradd --create-home --uid 10001 app \
+    && chown app /app
+
+USER app
 
 ENTRYPOINT ["/app/start.sh"]

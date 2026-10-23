@@ -13,6 +13,12 @@ from .graphql import execute_query as graphql_execute
 logger = logging.getLogger(__name__)
 
 
+def _quote_identifier(identifier: str) -> str:
+    """Return a DuckDB quoted identifier."""
+    escaped = identifier.replace('"', '""')
+    return f'"{escaped}"'
+
+
 def extract_tables_from_response(
     data: Any, name: str
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
@@ -65,16 +71,19 @@ def _extract_schema(data: list[dict], table_name: str) -> dict[str, Any]:
 
         with duckdb.connect() as conn:
             conn.execute(
-                f"CREATE TABLE {table_name} AS SELECT * FROM read_json_auto('{temp_file}')"
+                f"CREATE TABLE {_quote_identifier(table_name)} AS SELECT * FROM read_json_auto(?)",
+                [temp_file],
             )
-            schema = conn.execute(f"DESCRIBE {table_name}").fetchall()
+            schema = conn.execute(f"DESCRIBE {_quote_identifier(table_name)}").fetchall()
 
         schema_str = ", ".join([f"{col[0]}: {col[1]}" for col in schema])
 
         return {
             "rows": len(data),
             "schema": schema_str,
-            "hint": f"Use sql_query() to access fields. Example: SELECT {schema[0][0]} FROM {table_name}",
+            "hint": "Use sql_query() to access fields. Example: "
+            f"SELECT {_quote_identifier(schema[0][0])} "
+            f"FROM {_quote_identifier(table_name)}",
         }
     except Exception as e:
         logger.exception("Schema extraction error")
@@ -133,21 +142,11 @@ def truncate_for_context(
 
 
 def _query_result_rows(conn: duckdb.DuckDBPyConnection, query: str) -> list[dict[str, Any]]:
-    temp_file = None
-    try:
-        conn.sql(query).create("__sql_result")
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            temp_file = f.name
-        conn.execute("COPY __sql_result TO ? (FORMAT json, ARRAY true)", [temp_file])
-        with open(temp_file) as f:
-            rows = json.load(f)
-        return rows if isinstance(rows, list) else []
-    finally:
-        if temp_file:
-            try:
-                os.unlink(temp_file)
-            except OSError:
-                pass
+    conn.sql(query).create("__sql_result")
+    serialized_rows = conn.execute(
+        "SELECT to_json(struct_pack(*COLUMNS(*))) FROM __sql_result"
+    ).fetchall()
+    return [json.loads(row[0]) for row in serialized_rows]
 
 
 def execute_sql(data: Any, query: str) -> dict[str, Any]:
@@ -174,13 +173,18 @@ def execute_sql(data: Any, query: str) -> dict[str, Any]:
                             json.dump(value, f)
                             temp_files.append(f.name)
                         conn.execute(
-                            f"CREATE TABLE {key} AS SELECT * FROM read_json_auto('{f.name}')"
+                            f"CREATE TABLE {_quote_identifier(key)} AS "
+                            "SELECT * FROM read_json_auto(?)",
+                            [f.name],
                         )
             elif isinstance(data, list):
                 with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
                     json.dump(data, f)
                     temp_files.append(f.name)
-                conn.execute(f"CREATE TABLE data AS SELECT * FROM read_json_auto('{f.name}')")
+                conn.execute("CREATE TABLE data AS SELECT * FROM read_json_auto(?)", [f.name])
+
+            conn.execute("SET enable_external_access = false")
+            conn.execute("SET lock_configuration = true")
 
             rows = _query_result_rows(conn, query)
 

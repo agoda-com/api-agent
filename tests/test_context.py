@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
+from api_agent.config import settings
 from api_agent.context import (
     MissingHeaderError,
     RequestContext,
@@ -53,6 +54,16 @@ class TestGetRequestContext:
 
         with pytest.raises(MissingHeaderError, match="between 0 and 1"):
             parse_request_context({**headers, "x-recipe-learn-rate": "1.2"})
+
+    def test_target_host_allowlist(self):
+        headers = {"x-target-url": "https://api.internal.example/graphql", "x-api-type": "graphql"}
+
+        with patch.object(settings, "ALLOWED_TARGET_HOSTS", "*.internal.example"):
+            assert parse_request_context(headers).target_url == headers["x-target-url"]
+            with pytest.raises(MissingHeaderError, match="not allowed"):
+                parse_request_context({**headers, "x-target-url": "http://169.254.169.254/"})
+            with pytest.raises(MissingHeaderError, match="not allowed"):
+                parse_request_context({**headers, "x-base-url": "https://evil.example"})
 
     @patch("api_agent.context.get_http_headers")
     def test_extracts_all_headers(self, mock_headers):

@@ -3,6 +3,33 @@
 This file tracks notable service changes. It is not tied to package publishing,
 GitHub Releases, or tag-based deployment.
 
+## Query execution hardening - 2026-10-23
+
+### Added
+
+- Add `[server].allowed_target_hosts` to restrict target API hosts.
+- Add `SECURITY.md` with private reporting and deployment guidance.
+
+### Changed
+
+- Run SQL post-processing without file, network, or extension access.
+- Keep REST calls under the API base URL; encode path params as one segment;
+  match `X-Allow-Unsafe-Paths` against the resolved path (`{param}` matches a
+  value).
+- Allow only GraphQL query operations.
+- Escape recipe template values; scope learned recipes by target credentials.
+  Existing recipes are relearned.
+- Use OpenAPI `servers[0]` only on the spec's origin and resolve relative URLs;
+  set `X-Base-URL` for other hosts. Reject YAML aliases in specs.
+- Cap upstream responses at 10 MB and 60 seconds.
+- Default `[server].cors_allowed_origins` to empty and reject requests from
+  other browser origins.
+- Run the Docker image as a non-root user.
+
+### Fixed
+
+- Return the original agent error instead of a tracing error.
+
 ## Current
 
 ### Added

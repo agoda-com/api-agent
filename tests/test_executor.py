@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from api_agent.executor import (
     execute_sql,
     extract_tables_from_response,
@@ -102,6 +104,14 @@ class TestExtractTablesFromResponse:
         assert schema is not None
         assert schema["rows"] == 1
 
+    @pytest.mark.parametrize("table_name", ["select", 'odd"name', "x AS SELECT 9 AS id; --"])
+    def test_schema_handles_arbitrary_table_names(self, table_name):
+        _, schema = extract_tables_from_response({"id": 1}, table_name)
+
+        assert schema is not None
+        assert schema["rows"] == 1
+        assert schema["schema"] == "id: BIGINT"
+
 
 class TestExecuteSql:
     """Test execute_sql function."""
@@ -139,6 +149,30 @@ class TestExecuteSql:
         assert result["success"] is True
         assert result["result"][0]["total"] == 600
 
+    def test_join_and_nested_unnest(self):
+        data = {
+            "users": [{"id": 1, "team_id": 10, "tags": ["admin", "active"]}],
+            "teams": [{"id": 10, "name": "Core"}],
+        }
+        result = execute_sql(
+            data,
+            """
+            SELECT u.id, t.name, tag
+            FROM users AS u
+            JOIN teams AS t ON t.id = u.team_id
+            CROSS JOIN UNNEST(u.tags) AS tags(tag)
+            ORDER BY tag
+            """,
+        )
+
+        assert result == {
+            "success": True,
+            "result": [
+                {"id": 1, "name": "Core", "tag": "active"},
+                {"id": 1, "name": "Core", "tag": "admin"},
+            ],
+        }
+
     def test_date_results_are_json_serializable(self):
         data = {"items": [{"id": 1, "due_date": "2026-05-29"}]}
         result = execute_sql(
@@ -164,6 +198,17 @@ class TestExecuteSql:
         }
         json.dumps(result)
 
+    @pytest.mark.parametrize("column", ["t", "T", "__sql_result"])
+    def test_result_serialization_preserves_alias_like_columns(self, column):
+        data = {"data": [{column: "value", "id": 1}]}
+
+        result = execute_sql(data, "SELECT * FROM data")
+
+        assert result == {
+            "success": True,
+            "result": [{column: "value", "id": 1}],
+        }
+
     def test_invalid_sql_returns_error(self):
         """Invalid SQL returns error."""
         data = {"users": [{"id": 1}]}
@@ -179,6 +224,53 @@ class TestExecuteSql:
 
         assert result["success"] is False
         assert "error" in result
+
+    def test_table_name_cannot_inject_sql(self):
+        table_name = "users AS SELECT 999 AS id; --"
+        result = execute_sql({table_name: [{"id": 1}]}, f'SELECT * FROM "{table_name}"')
+
+        assert result == {"success": True, "result": [{"id": 1}]}
+
+    def test_external_file_reads_are_blocked(self, tmp_path):
+        marker = tmp_path / "private.txt"
+        marker.write_text("PRIVATE_MARKER")
+
+        result = execute_sql(
+            {"users": [{"id": 1}]},
+            f"SELECT * FROM read_text('{marker.as_posix()}')",
+        )
+
+        assert "Permission Error" in result["error"]
+        assert "PRIVATE_MARKER" not in json.dumps(result)
+
+    def test_copy_in_stacked_sql_is_blocked(self, tmp_path):
+        output = tmp_path / "stolen.csv"
+        result = execute_sql(
+            {"users": [{"id": 1}]},
+            f"COPY users TO '{output.as_posix()}'; SELECT * FROM users",
+        )
+
+        assert result["success"] is False
+        assert not output.exists()
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SET enable_external_access = true; SELECT * FROM users",
+            "SET lock_configuration = false; SELECT * FROM users",
+        ],
+    )
+    def test_security_configuration_cannot_be_changed(self, query):
+        result = execute_sql({"users": [{"id": 1}]}, query)
+
+        assert result["success"] is False
+        assert "locked" in result["error"].lower()
+
+    @pytest.mark.parametrize("statement", ["INSTALL httpfs", "LOAD httpfs"])
+    def test_external_extensions_are_blocked(self, statement):
+        result = execute_sql({"users": [{"id": 1}]}, f"{statement}; SELECT * FROM users")
+
+        assert "Permission Error" in result["error"]
 
 
 class TestTruncateForContext:
