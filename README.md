@@ -204,10 +204,15 @@ App configuration lives in `api-agent.toml`. Environment variables do not overri
 | `[storage].backend` | `memory` | `memory` or `redis` |
 | `[storage].namespace` | `api-agent` | Redis key namespace |
 | `[redis].url` | empty | required only for Redis storage |
+| `[schema].cache_ttl_seconds` | `300` | time a successfully fetched API schema stays fresh |
+| `[schema].stale_max_age_seconds` | `86400` | maximum additional age for fallback schemas after refresh failures |
+| `[schema].failure_backoff_seconds` | `30` | suppress repeat schema requests after a refresh failure |
 
 Docker copies this TOML to `/app/api-agent.toml`, and `start.sh` sets `API_AGENT_CONFIG=/app/api-agent.toml` by default. Keep app settings in TOML, set `OPENAI_API_KEY` in env, and leave proxy/OTEL to env.
 
 `[storage]` backs learned recipes and generated downstream tool descriptions. Generated descriptions are cached by API id and schema hash. If description generation fails or times out, API Agent returns a deterministic fallback and caches that fallback for 5 minutes before retrying generation.
+
+Loaded GraphQL and OpenAPI schemas are cached in process memory. A fresh entry avoids another schema request until its TTL expires; after a refresh failure, the last good schema is used up to the configured stale age, and further refresh attempts for that endpoint are suppressed during the failure backoff. The cache is bounded to 1,000 entries and is not persisted to Redis. Cache keys include a one-way digest of the endpoint and effective target headers, so credentials are not stored in the key and requests with different target headers do not share schemas. Set both the TTL and stale age to `0` to disable successful-schema reuse; the failure backoff remains independently configurable.
 
 ---
 

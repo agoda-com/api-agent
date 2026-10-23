@@ -42,3 +42,8 @@ namespace = "api-agent"
 
 [redis]
 url = ""
+
+[schema]
+cache_ttl_seconds = 300
+stale_max_age_seconds = 86400
+failure_backoff_seconds = 30

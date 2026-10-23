@@ -7,6 +7,7 @@ GitHub Releases, or tag-based deployment.
 
 ### Added
 
+- Cache GraphQL and OpenAPI schemas in process memory, reuse stale schemas during refresh failures, and back off repeated failing refreshes.
 - Add generated downstream API descriptions with storage-backed caching.
 - Add shared memory/Redis storage for recipes and generated descriptions.
 - Add configurable description model and timeout.

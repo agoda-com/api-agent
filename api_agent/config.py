@@ -58,6 +58,11 @@ _TOML_MAP: dict[str, dict[str, str]] = {
         "model_name": "DESCRIPTION_MODEL_NAME",
         "timeout_seconds": "DESCRIPTION_TIMEOUT_SECONDS",
     },
+    "schema": {
+        "cache_ttl_seconds": "SCHEMA_CACHE_TTL_SECONDS",
+        "stale_max_age_seconds": "SCHEMA_STALE_MAX_AGE_SECONDS",
+        "failure_backoff_seconds": "SCHEMA_FAILURE_BACKOFF_SECONDS",
+    },
 }
 
 _ENV_OVERRIDES = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "PORT")
@@ -166,6 +171,11 @@ class Settings(BaseSettings):
 
     # Redis-backed storage
     REDIS_URL: str = ""
+
+    # Process-local API schema cache
+    SCHEMA_CACHE_TTL_SECONDS: float = 300.0
+    SCHEMA_STALE_MAX_AGE_SECONDS: float = 86400.0
+    SCHEMA_FAILURE_BACKOFF_SECONDS: float = 30.0
 
 
 settings = Settings()

@@ -38,6 +38,7 @@ from ..recipe.learning import async_validate_and_prepare_recipe
 from ..recipe.search import build_api_id
 from ..recipe.state import _set_return_directly, mark_recipe_tool_used
 from ..recipe.tooling import build_recipe_docstring, create_params_model, deduplicate_tool_name
+from ..schema_cache import schema_cache, schema_cache_key
 from .contextvar_utils import safe_append_contextvar_list, safe_get_contextvar
 from .prompts import (
     CONTEXT_SECTION,
@@ -123,24 +124,72 @@ def _is_depth_limit_error(result: dict) -> bool:
     return False
 
 
+async def _load_graphql_schema_data(
+    endpoint: str,
+    headers: dict[str, str] | None,
+) -> dict[str, Any] | None:
+    """Load GraphQL introspection with a credential-scoped stale fallback."""
+    cache_key = schema_cache_key("graphql", endpoint, headers)
+    cached = schema_cache.get(
+        cache_key,
+        ttl_seconds=settings.SCHEMA_CACHE_TTL_SECONDS,
+        stale_max_age_seconds=settings.SCHEMA_STALE_MAX_AGE_SECONDS,
+    )
+    if cached and not cached.stale:
+        return cached.value
+    if schema_cache.is_circuit_open(cache_key):
+        if cached:
+            logger.warning("GraphQL schema refresh is backed off; using cached schema")
+            return cached.value
+        logger.warning("GraphQL schema refresh is backed off; no cached schema is available")
+        return None
+
+    try:
+        result = await graphql_fetch(_INTROSPECTION_QUERY, None, endpoint, headers)
+
+        # Retry with shallow introspection if depth limit exceeded.
+        if not result.get("success") and _is_depth_limit_error(result):
+            logger.info("Full introspection failed (depth limit), retrying with shallow query")
+            result = await graphql_fetch(_INTROSPECTION_QUERY_SHALLOW, None, endpoint, headers)
+
+        data = result.get("data")
+        schema = data.get("__schema") if result.get("success") and isinstance(data, dict) else None
+        if isinstance(schema, dict):
+            schema_cache.record_success(cache_key, schema)
+            return schema
+        schema_cache.record_failure(
+            cache_key,
+            backoff_seconds=settings.SCHEMA_FAILURE_BACKOFF_SECONDS,
+        )
+        if cached:
+            logger.warning("GraphQL schema refresh failed; using cached schema")
+            return cached.value
+        return None
+    except Exception as e:
+        schema_cache.record_failure(
+            cache_key,
+            backoff_seconds=settings.SCHEMA_FAILURE_BACKOFF_SECONDS,
+        )
+        if cached:
+            logger.warning(
+                "GraphQL schema refresh failed (%s); using cached schema", type(e).__name__
+            )
+            return cached.value
+        logger.warning("GraphQL schema refresh failed (%s)", type(e).__name__)
+        return None
+
+
 async def _fetch_schema_context(endpoint: str, headers: dict[str, str] | None) -> str:
-    """Fetch schema in compact SDL format. Falls back to shallow query on depth limit."""
-    result = await graphql_fetch(_INTROSPECTION_QUERY, None, endpoint, headers)
-
-    # Retry with shallow introspection if depth limit exceeded
-    if not result.get("success") and _is_depth_limit_error(result):
-        logger.info("Full introspection failed (depth limit), retrying with shallow query")
-        result = await graphql_fetch(_INTROSPECTION_QUERY_SHALLOW, None, endpoint, headers)
-
-    if not result.get("success") or not result.get("data"):
+    """Fetch schema in compact SDL format. Falls back to the last good schema."""
+    schema = await _load_graphql_schema_data(endpoint, headers)
+    if schema is None:
+        _raw_schema.set("")
         return ""
 
-    schema = result["data"]["__schema"]
-
-    # Store raw introspection JSON for grep-like search (preserves all info)
+    # Store raw introspection JSON for grep-like search (preserves all info).
     _raw_schema.set(json.dumps(schema, indent=2))
 
-    # Build DSL for LLM context
+    # Build DSL for LLM context.
     context = build_schema_context(schema)
 
     if len(context) > settings.MAX_SCHEMA_CHARS:
@@ -156,17 +205,8 @@ async def _fetch_schema_context(endpoint: str, headers: dict[str, str] | None) -
 
 async def fetch_graphql_schema_raw(endpoint: str, headers: dict[str, str] | None) -> str:
     """Fetch raw GraphQL schema JSON for matching and validation."""
-    result = await graphql_fetch(_INTROSPECTION_QUERY, None, endpoint, headers)
-
-    if not result.get("success") and _is_depth_limit_error(result):
-        logger.info("Full introspection failed (depth limit), retrying with shallow query")
-        result = await graphql_fetch(_INTROSPECTION_QUERY_SHALLOW, None, endpoint, headers)
-
-    if not result.get("success") or not result.get("data"):
-        return ""
-
-    schema = result["data"]["__schema"]
-    return json.dumps(schema, indent=2)
+    schema = await _load_graphql_schema_data(endpoint, headers)
+    return json.dumps(schema, indent=2) if schema is not None else ""
 
 
 def _build_system_prompt(recipe_context: str = "") -> str:
