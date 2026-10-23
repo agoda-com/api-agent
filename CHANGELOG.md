@@ -25,6 +25,8 @@ GitHub Releases, or tag-based deployment.
 - Default `[server].cors_allowed_origins` to empty and reject requests from
   other browser origins.
 - Run the Docker image as a non-root user.
+- Upgrade dependencies with known advisories (`mcp`, `starlette`, `urllib3`,
+  `cryptography`, OpenTelemetry, and others).
 
 ### Fixed
 

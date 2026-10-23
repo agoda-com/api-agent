@@ -5,7 +5,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import Literal
 from urllib.parse import urlparse
 
 from fastmcp.server.dependencies import get_http_headers
@@ -90,7 +90,7 @@ def parse_request_context(headers: dict[str, str]) -> RequestContext:
     if base_url_raw:
         _check_target_host(base_url_raw)
 
-    typed_api_type = cast(ApiType, api_type)
+    typed_api_type: ApiType = api_type
     extra = {"target_url": target_url, "api_type": api_type}
     target_headers = _parse_json_object(target_headers_raw, "target headers", extra)
     passthrough_names = _parse_json_string_tuple(
