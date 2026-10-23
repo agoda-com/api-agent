@@ -74,9 +74,41 @@ def _rest_step(
 
 
 def test_render_text_template_basic():
-    assert render_text_template("limit {{n}}", {"n": 10}) == "limit 10"
-    assert render_text_template("active={{flag}}", {"flag": True}) == "active=true"
-    assert render_text_template("v={{x}}", {"x": None}) == "v=null"
+    assert render_text_template("limit {{n}}", {"n": 10}, "sql") == "limit 10"
+    assert render_text_template("active={{flag}}", {"flag": True}, "graphql") == "active=true"
+    assert render_text_template("v={{x}}", {"x": None}, "graphql") == "v=null"
+    assert render_text_template("{ o(s: {{s}}) }", {"s": "ACTIVE"}, "graphql") == "{ o(s: ACTIVE) }"
+
+
+def test_render_text_template_escapes_injection():
+    payload = 'x") { secret } #'
+    assert (
+        render_text_template('{ u(name: "{{n}}") { id } }', {"n": payload}, "graphql")
+        == '{ u(name: "x\\") { secret } #") { id } }'
+    )
+    assert (
+        render_text_template("{ u(id: {{n}}) { id } }", {"n": payload}, "graphql")
+        == '{ u(id: "x\\") { secret } #") { id } }'
+    )
+    assert (
+        render_text_template("WHERE t ILIKE '{{n}}%'", {"n": "a' OR 1=1 --"}, "sql")
+        == "WHERE t ILIKE 'a'' OR 1=1 --%'"
+    )
+
+
+def test_render_text_template_skips_comments_and_block_strings():
+    assert (
+        render_text_template("-- don't\nWHERE n = '{{n}}'", {"n": "a' OR 1=1"}, "sql")
+        == "-- don't\nWHERE n = 'a'' OR 1=1'"
+    )
+    assert (
+        render_text_template('# "\n{ u(n: "{{n}}") }', {"n": 'x"y'}, "graphql")
+        == '# "\n{ u(n: "x\\"y") }'
+    )
+    assert (
+        render_text_template('{ u(n: """{{n}}""") }', {"n": 'a\nb"""c'}, "graphql")
+        == '{ u(n: """a\nb\\"""c""") }'
+    )
 
 
 def test_sha256_hex_normalizes_json():
@@ -474,7 +506,7 @@ def test_render_text_template_missing_param_raises():
     import pytest
 
     with pytest.raises(KeyError):
-        render_text_template("limit {{n}}", {})
+        render_text_template("limit {{n}}", {}, "sql")
 
 
 def test_validate_recipe_params_requires_all_params():

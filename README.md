@@ -12,6 +12,8 @@ Point at any GraphQL or REST API. Ask questions in natural language. The agent f
 
 **🔒 Safe by default.** Read-only. Mutations blocked unless explicitly allowed.
 
+SQL runs sandboxed: no file, network, or extension access. REST calls stay under the API base URL; GraphQL allows only query operations. Recipes are scoped per target and credentials. Report vulnerabilities via [SECURITY.md](SECURITY.md).
+
 **🧠 Recipe learning.** Agent samples successful queries into reusable workflows. Ask once, reuse cached pipelines that execute without LLM reasoning. Learned recipes are exposed as tools named `r_<tool_name>`.
 
 ## Quick Start
@@ -182,7 +184,8 @@ App configuration lives in `api-agent.toml`. Environment variables do not overri
 | `[server].port` | `3000` | bind port; env `PORT` may override |
 | `[server].transport` | `streamable-http` | `http`, `streamable-http`, or `sse` |
 | `[server].stateless_http` | `true` | stateless MCP HTTP mode |
-| `[server].cors_allowed_origins` | `*` | comma-separated origins |
+| `[server].cors_allowed_origins` | empty | comma-separated browser origins; requests with any other `Origin` get 403; `*` allows all |
+| `[server].allowed_target_hosts` | empty | comma-separated host globs (e.g. `*.example.com`) for `X-Target-URL`/`X-Base-URL`; empty allows any host |
 | `[server].debug` | `false` | debug logging |
 | `[model].api` | `responses` | `responses` or `chat_completions` |
 | `[model].name` | `gpt-5.5` | model name |
@@ -271,7 +274,7 @@ Agents use the OpenAI Responses API model path by default. Set `[model].api = "c
 
 Current target scope: each query runs against one configured API target. Multi-endpoint support should expose multiple named targets, but cross-target joins are intentionally out of scope for now.
 
-REST specs can be JSON or YAML. OpenAPI 3.x is used directly; Swagger 2.0 is normalized into an OpenAPI 3.0-compatible shape. For REST base URLs, the agent uses `X-Base-URL` first, then `servers[0].url`, then derives the origin from the spec URL.
+REST specs can be JSON or YAML. OpenAPI 3.x is used directly; Swagger 2.0 is normalized into an OpenAPI 3.0-compatible shape. For REST base URLs, the agent uses `X-Base-URL` first, then `servers[0].url` (resolved against the spec URL, and only if on the spec's origin), then derives the origin from the spec URL. Spec YAML anchors/aliases are not supported.
 
 ---
 

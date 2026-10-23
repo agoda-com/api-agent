@@ -2,10 +2,13 @@
 
 import fnmatch
 import logging
+import re
 from typing import Any
-from urllib.parse import urlencode, urljoin
+from urllib.parse import quote, urlencode, urljoin, urlsplit
 
 import httpx
+
+from ..utils.http import bounded_request
 
 logger = logging.getLogger(__name__)
 
@@ -49,11 +52,8 @@ def _build_http_error_response(e: httpx.HTTPStatusError) -> dict[str, Any]:
 
 
 def _is_path_allowed(path: str, patterns: list[str]) -> bool:
-    """Check if path matches any allowed pattern (fnmatch glob)."""
-    for pattern in patterns:
-        if fnmatch.fnmatch(path, pattern):
-            return True
-    return False
+    """Check if path matches any allowed pattern (fnmatch glob; {param} matches a value)."""
+    return any(fnmatch.fnmatch(path, re.sub(r"\{[^/{}]+\}", "*", p)) for p in patterns)
 
 
 def _build_url(
@@ -76,12 +76,15 @@ def _build_url(
     # Substitute path params
     if path_params:
         for key, value in path_params.items():
-            path = path.replace(f"{{{key}}}", str(value))
+            path = path.replace(f"{{{key}}}", quote(str(value), safe=""))
 
     if not base_url:
         raise ValueError("No base URL provided")
 
     url = urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
+    base, target = urlsplit(base_url), urlsplit(url)
+    if target[:2] != base[:2] or not (target.path + "/").startswith(base.path.rstrip("/") + "/"):
+        raise ValueError("Path must stay on the API base URL")
 
     # Add query params
     if query_params:
@@ -121,59 +124,55 @@ async def execute_request(
         Dict with success/data or error
     """
     method = method.upper()
-
-    # Block unsafe methods by default
-    if method in _UNSAFE_METHODS and not allow_unsafe:
-        # Check if path matches allowlist
-        if not allow_unsafe_paths or not _is_path_allowed(path, allow_unsafe_paths):
-            return {
-                "success": False,
-                "error": f"{method} method not allowed (read-only mode). Use X-Allow-Unsafe-Paths header.",
-            }
+    if method not in {"GET", *_UNSAFE_METHODS}:
+        return {"success": False, "error": f"Unsupported method: {method}"}
 
     try:
         url = _build_url(path, base_url, path_params, query_params)
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
+    # Block unsafe methods by default; match the allowlist on the resolved path.
+    api_path = "/" + urlsplit(url).path[len(urlsplit(base_url).path.rstrip("/")) :].lstrip("/")
+    if method in _UNSAFE_METHODS and not allow_unsafe:
+        if not allow_unsafe_paths or not _is_path_allowed(api_path, allow_unsafe_paths):
+            return {
+                "success": False,
+                "error": f"{method} method not allowed (read-only mode). Use X-Allow-Unsafe-Paths header.",
+            }
+
     request_headers = {"Accept": "application/json"}
     if headers:
         request_headers.update(headers)
-    # Log request details without leaking header values (e.g., auth tokens).
+    # Log request details without leaking header values or query strings (may hold API keys).
     logger.info(
         "REST request resolved: method=%s base_url=%s path=%s url=%s header_keys=%s",
         method,
         base_url,
         path,
-        url,
+        url.split("?", 1)[0],
         sorted(request_headers.keys()),
     )
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            if method == "GET":
-                resp = await client.get(url, headers=request_headers)
-            elif method in {"POST", "PUT", "PATCH"}:
-                request_headers["Content-Type"] = "application/json"
-                resp = await client.request(method, url, json=body, headers=request_headers)
-            elif method == "DELETE":
-                resp = await client.delete(url, headers=request_headers)
-            else:
-                return {"success": False, "error": f"Unsupported method: {method}"}
+    kwargs: dict[str, Any] = {}
+    if method in {"POST", "PUT", "PATCH"}:
+        request_headers["Content-Type"] = "application/json"
+        kwargs["json"] = body
+    try:
+        resp = await bounded_request(method, url, headers=request_headers, **kwargs)
+        resp.raise_for_status()
 
-            resp.raise_for_status()
+        # Handle different content types
+        content_type = resp.headers.get("content-type", "")
+        if "application/json" in content_type:
+            data = resp.json()
+        else:
+            data = resp.text
 
-            # Handle different content types
-            content_type = resp.headers.get("content-type", "")
-            if "application/json" in content_type:
-                data = resp.json()
-            else:
-                data = resp.text
+        return {"success": True, "data": data}
 
-            return {"success": True, "data": data}
-
-        except httpx.HTTPStatusError as e:
-            return _build_http_error_response(e)
-        except Exception as e:
-            logger.exception("REST API error")
-            return {"success": False, "error": str(e)}
+    except httpx.HTTPStatusError as e:
+        return _build_http_error_response(e)
+    except Exception as e:
+        logger.exception("REST API error")
+        return {"success": False, "error": str(e)}

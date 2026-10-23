@@ -1,15 +1,29 @@
 """GraphQL client."""
 
 import logging
-import re
 from typing import Any
 
 import httpx
+from graphql import GraphQLError, OperationDefinitionNode, OperationType, parse
+
+from ..utils.http import bounded_request
 
 logger = logging.getLogger(__name__)
 
-# Block mutations (read-only mode)
-_MUTATION_PATTERN = re.compile(r"^\s*mutation\b", re.IGNORECASE | re.MULTILINE)
+
+def _read_only_error(query: str) -> str | None:
+    """Return an error unless every operation in the document is a query."""
+    try:
+        document = parse(query)
+    except GraphQLError as e:
+        return f"Invalid GraphQL query: {e.message}"
+    for definition in document.definitions:
+        if (
+            isinstance(definition, OperationDefinitionNode)
+            and definition.operation != OperationType.QUERY
+        ):
+            return "Mutations are not allowed (read-only mode)"
+    return None
 
 
 async def execute_query(
@@ -33,8 +47,8 @@ async def execute_query(
         return {"success": False, "error": "No endpoint provided"}
 
     # Block mutations
-    if _MUTATION_PATTERN.search(query):
-        return {"success": False, "error": "Mutations are not allowed (read-only mode)"}
+    if error := _read_only_error(query):
+        return {"success": False, "error": error}
 
     request_headers = {"Content-Type": "application/json"}
     if headers:
@@ -44,20 +58,15 @@ async def execute_query(
     if variables:
         payload["variables"] = variables
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            resp = await client.post(
-                endpoint,
-                json=payload,
-                headers=request_headers,
-            )
-            resp.raise_for_status()
-            result = resp.json()
-            if "errors" in result:
-                return {"success": False, "error": result["errors"]}
-            return {"success": True, "data": result.get("data", {})}
-        except httpx.HTTPStatusError as e:
-            return {"success": False, "error": f"HTTP {e.response.status_code}"}
-        except Exception as e:
-            logger.exception("GraphQL error")
-            return {"success": False, "error": str(e)}
+    try:
+        resp = await bounded_request("POST", endpoint, json=payload, headers=request_headers)
+        resp.raise_for_status()
+        result = resp.json()
+        if "errors" in result:
+            return {"success": False, "error": result["errors"]}
+        return {"success": True, "data": result.get("data", {})}
+    except httpx.HTTPStatusError as e:
+        return {"success": False, "error": f"HTTP {e.response.status_code}"}
+    except Exception as e:
+        logger.exception("GraphQL error")
+        return {"success": False, "error": str(e)}

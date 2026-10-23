@@ -1,14 +1,11 @@
 """OpenTelemetry tracing setup."""
 
-import logging
 from contextlib import contextmanager
 from typing import Any, Generator
 
 from openinference.instrumentation import using_metadata
 from openinference.semconv.trace import OpenInferenceSpanKindValues, SpanAttributes
 from opentelemetry import trace
-
-logger = logging.getLogger(__name__)
 
 tracer = trace.get_tracer(__name__)
 
@@ -48,12 +45,7 @@ def trace_span(name: str, attributes: dict[str, Any] | None = None) -> Generator
     Yields:
         Span object (or None if tracing disabled)
     """
-    try:
-        with tracer.start_as_current_span(name) as span:
-            if attributes and span:
-                for key, value in attributes.items():
-                    span.set_attribute(key, value)
-            yield span
-    except Exception:
-        logger.warning("Failed to create span", exc_info=True)
-        yield None
+    with tracer.start_as_current_span(name) as span:
+        if attributes and span:
+            span.set_attributes(attributes)
+        yield span

@@ -243,6 +243,8 @@ class DynamicToolNamingMiddleware(Middleware):
 
         # Handle recipe tools directly
         if tool_name.startswith(RECIPE_PREFIX_STR):
+            if not settings.ENABLE_RECIPES:
+                raise ToolError("recipes are disabled")
             recipe_slug = tool_name.removeprefix(RECIPE_PREFIX_STR)
             try:
                 req_ctx = get_request_context()

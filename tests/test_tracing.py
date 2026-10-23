@@ -1,3 +1,5 @@
+import pytest
+
 from api_agent import tracing
 
 
@@ -22,3 +24,9 @@ def test_span_trace_id_formats_recording_span():
 
 def test_span_trace_id_skips_invalid_span():
     assert tracing.span_trace_id(None) is None
+
+
+def test_trace_span_propagates_body_errors():
+    with pytest.raises(ValueError, match="boom"):
+        with tracing.trace_span("x", {"k": "v"}):
+            raise ValueError("boom")

@@ -1,5 +1,8 @@
 """Tests for REST/OpenAPI schema context generation."""
 
+from unittest.mock import patch
+
+import httpx
 import pytest
 
 from api_agent.rest.schema_loader import (
@@ -9,6 +12,8 @@ from api_agent.rest.schema_loader import (
     _normalize_swagger2_to_oas3,
     _schema_to_type,
     build_schema_context,
+    get_base_url_from_spec,
+    load_openapi_spec,
 )
 
 
@@ -472,3 +477,28 @@ class TestSwagger2Normalization:
         ctx = build_schema_context(normalized)
         assert "GET /users/{id}(id: str) -> User" in ctx
         assert "User { id: str! }" in ctx
+
+
+class TestSpecLoadingSafety:
+    @pytest.mark.parametrize(
+        ("server", "expected"),
+        [
+            ("https://api.example.com/v1", "https://api.example.com/v1"),
+            ("/v1", "https://api.example.com/v1"),
+            ("https://API.example.com:443/v1", "https://API.example.com:443/v1"),
+            ("https://evil.example/v1", "https://api.example.com"),
+        ],
+    )
+    def test_base_url_stays_on_spec_origin(self, server, expected):
+        spec = {"servers": [{"url": server}]}
+
+        assert get_base_url_from_spec(spec, "https://api.example.com/openapi.json") == expected
+
+    @pytest.mark.asyncio
+    async def test_yaml_aliases_are_rejected(self):
+        bomb = 'openapi: "3.0.0"\na: &a ["x","x"]\nb: &b [*a,*a]\nc: [*b,*b]\n'
+        response = httpx.Response(
+            200, text=bomb, request=httpx.Request("GET", "https://api.example.com/spec.yaml")
+        )
+        with patch("api_agent.rest.schema_loader.bounded_request", return_value=response):
+            assert await load_openapi_spec("https://api.example.com/spec.yaml") == {}
