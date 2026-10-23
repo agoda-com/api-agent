@@ -55,6 +55,11 @@ namespace = "test-agent"
 
 [redis]
 url = "redis://localhost:6379/2"
+
+[schema]
+cache_ttl_seconds = 60
+stale_max_age_seconds = 600
+failure_backoff_seconds = 15
 """,
     )
     monkeypatch.setenv("API_AGENT_CONFIG", str(path))
@@ -91,6 +96,9 @@ url = "redis://localhost:6379/2"
     assert settings.RECIPE_LEARN_RATE == 0.5
     assert settings.STORAGE_NAMESPACE == "test-agent"
     assert settings.REDIS_URL == "redis://localhost:6379/2"
+    assert settings.SCHEMA_CACHE_TTL_SECONDS == 60
+    assert settings.SCHEMA_STALE_MAX_AGE_SECONDS == 600
+    assert settings.SCHEMA_FAILURE_BACKOFF_SECONDS == 15
 
 
 def test_env_does_not_override_app_settings(monkeypatch):
@@ -103,6 +111,9 @@ def test_env_does_not_override_app_settings(monkeypatch):
 
     assert settings.MODEL_NAME == "gpt-5.5"
     assert settings.DESCRIPTION_TIMEOUT_SECONDS == 15.0
+    assert settings.SCHEMA_CACHE_TTL_SECONDS == 300.0
+    assert settings.SCHEMA_STALE_MAX_AGE_SECONDS == 86400.0
+    assert settings.SCHEMA_FAILURE_BACKOFF_SECONDS == 30.0
 
 
 def test_openai_api_key_loads_from_env(monkeypatch):

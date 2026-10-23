@@ -9,6 +9,7 @@ import httpx
 import yaml
 
 from ..config import settings
+from ..schema_cache import schema_cache, schema_cache_key
 
 logger = logging.getLogger(__name__)
 
@@ -244,6 +245,20 @@ async def load_openapi_spec(
         return {}
 
     request_headers = dict(headers) if headers else {}
+    cache_key = schema_cache_key("rest", spec_url, request_headers)
+    cached = schema_cache.get(
+        cache_key,
+        ttl_seconds=settings.SCHEMA_CACHE_TTL_SECONDS,
+        stale_max_age_seconds=settings.SCHEMA_STALE_MAX_AGE_SECONDS,
+    )
+    if cached and not cached.stale:
+        return cached.value
+    if schema_cache.is_circuit_open(cache_key):
+        if cached:
+            logger.warning("OpenAPI schema refresh is backed off; using cached schema")
+            return cached.value
+        logger.warning("OpenAPI schema refresh is backed off; no cached schema is available")
+        return {}
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -258,26 +273,36 @@ async def load_openapi_spec(
             spec = yaml.safe_load(raw)
 
         if not isinstance(spec, dict):
-            logger.warning("OpenAPI spec root is not an object")
-            return {}
+            raise ValueError("OpenAPI spec root is not an object")
 
         # Validate/normalize OpenAPI shape
         openapi_version = spec.get("openapi", "")
         if isinstance(openapi_version, str) and openapi_version.startswith("3."):
-            return spec
+            normalized = spec
+        else:
+            swagger_version = spec.get("swagger", "")
+            if isinstance(swagger_version, str) and swagger_version.startswith("2."):
+                logger.info("Detected Swagger 2.0 spec, normalizing to OpenAPI 3.0 shape")
+                normalized = _normalize_swagger2_to_oas3(spec)
+            else:
+                raise ValueError(
+                    f"Unsupported API schema version. openapi={openapi_version!r}, "
+                    f"swagger={swagger_version!r}"
+                )
 
-        swagger_version = spec.get("swagger", "")
-        if isinstance(swagger_version, str) and swagger_version.startswith("2."):
-            logger.info("Detected Swagger 2.0 spec, normalizing to OpenAPI 3.0 shape")
-            return _normalize_swagger2_to_oas3(spec)
-
-        logger.warning(
-            f"Unsupported API schema version. openapi={openapi_version!r}, swagger={swagger_version!r}"
-        )
-        return {}
-
+        schema_cache.record_success(cache_key, normalized)
+        return normalized
     except Exception as e:
-        logger.exception(f"Failed to load OpenAPI spec: {e}")
+        schema_cache.record_failure(
+            cache_key,
+            backoff_seconds=settings.SCHEMA_FAILURE_BACKOFF_SECONDS,
+        )
+        if cached:
+            logger.warning(
+                "Failed to refresh OpenAPI schema (%s); using cached schema", type(e).__name__
+            )
+            return cached.value
+        logger.warning("Failed to load OpenAPI schema (%s)", type(e).__name__)
         return {}
 
 
